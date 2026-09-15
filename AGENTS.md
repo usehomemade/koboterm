@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 koboterm — an SSH terminal client for Kobo e-readers. Sit with a Kobo, connect to a remote machine, and work in a terminal (the primary use case is running Claude Code over SSH). `CLAUDE.md` is a symlink to this file; edit `AGENTS.md`.
 
-**Status: remote shell works, no input yet.** `koboterm ssh user@host` opens an SSH session from the Kobo and renders it on the e-ink screen (67x45 cells at Spleen 16x32 on the Clara BW); `koboterm run -- CMD` does the same for a local pty. Keystrokes can only be injected with `--type` so far: no keyboard, no launcher, no reconnect, no installer. License is GPL-3.0-or-later because FBInk is linked in.
+**Status: usable by its author.** `koboterm app` (launched from NickelMenu via `host/kobo/koboterm.sh`) shows a home screen of machines, pairs new ones over HTTP (`curl ... | sh` on the machine), opens SSH sessions with an on-screen keyboard, swipe scrolling and three terminal sizes, and freezes Nickel while it runs. Missing: packaged installer (KoboRoot.tgz), auto-reconnect after Wi-Fi loss, host key verification, idle sleep, physical keyboards. License is GPL-3.0-or-later because FBInk is linked in. `README.md` is the user-facing summary.
 
 ## Commands
 

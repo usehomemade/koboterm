@@ -38,11 +38,9 @@ pub fn run() -> Result<()> {
     let hosts_path = dir.join("hosts");
     let mut hosts = HostEntry::load(&hosts_path)?;
 
-    // Let the launcher's menu close before we snapshot what is underneath.
-    std::thread::sleep(Duration::from_millis(1200));
     let font = font::Font::from_bdf(font::SPLEEN_16X32);
     let mut panel = FbinkPanel::open(font)?;
-    let saved = panel.save_screen();
+    let saved = stable_screen(&panel);
     let map = TouchMap {
         swap_axes: panel.touch_swap_axes,
         mirror_x: panel.touch_mirror_x,
@@ -71,6 +69,26 @@ enum Wait {
     Tap(u16, u16),
     Registered(HostEntry),
     Timeout,
+}
+
+/// Snapshot of the framebuffer taken once Nickel has stopped drawing (the
+/// launcher's menu is closing when we start). Waits for 1.2 s of no change,
+/// at most 8 s.
+fn stable_screen(panel: &FbinkPanel) -> Vec<u8> {
+    let start = Instant::now();
+    let mut last = panel.save_screen();
+    let mut stable_since = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = panel.save_screen();
+        if now != last {
+            last = now;
+            stable_since = Instant::now();
+        }
+        if stable_since.elapsed() >= Duration::from_millis(1200) || start.elapsed() >= Duration::from_secs(8) {
+            return last;
+        }
+    }
 }
 
 fn wait_tap(panel: &FbinkPanel, touch: &mut TouchDevice, timeout: Duration) -> Option<(u16, u16)> {

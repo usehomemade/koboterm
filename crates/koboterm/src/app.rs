@@ -10,7 +10,7 @@ use render::{Config, Renderer};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use term::Terminal;
-use transport::{SshTarget, SshTransport, Transport};
+use transport::{SshTarget, SshTransport, Transport, LOST};
 use ui::{draw, AddForm, FormAction, Home, HomeAction, HostEntry, Osk, OskAction, TextSize};
 
 use crate::pair::PairServer;
@@ -303,6 +303,7 @@ struct Layout {
     osk_visible: bool,
     term: Region,
     osk: Region,
+    margin: u32,
 }
 
 impl Layout {
@@ -314,7 +315,7 @@ impl Layout {
         let osk = panel.region(UI_FONT, margin, osk_top, bottom);
         let term_bottom = if osk_visible { osk_top.saturating_sub(ui.fh / 2) } else { bottom };
         let term = panel.region(TERM_FONT, margin, margin, term_bottom);
-        Layout { osk_visible, term, osk }
+        Layout { osk_visible, term, osk, margin }
     }
 }
 
@@ -336,8 +337,42 @@ fn relayout(panel: &mut FbinkPanel, layout: &Layout, osk: &Osk, term: &mut Termi
     Ok(renderer)
 }
 
+enum End {
+    /// Remote command finished with this status.
+    Exit(i32),
+    /// User tapped Home.
+    Home,
+    /// Connection dropped.
+    Lost,
+}
+
+struct SessionState {
+    layout: Layout,
+    osk: Osk,
+    term: Terminal,
+    renderer: Renderer,
+    pending_release: Vec<(usize, u64)>,
+    finger_down: Option<(i32, i32)>,
+    t0: Instant,
+}
+
+fn ms(t0: Instant) -> u64 {
+    t0.elapsed().as_millis() as u64
+}
+
+/// One-line notice at the bottom of the terminal band.
+fn banner(panel: &mut FbinkPanel, st: &SessionState, text: &str) {
+    panel.use_region(st.layout.term);
+    let r = st.layout.term.rows.saturating_sub(1);
+    let cols = st.layout.term.cols;
+    let line: String = format!("{text:<width$}", width = cols as usize).chars().take(cols as usize).collect();
+    draw::text(panel, 0, r, &line, true, true);
+    panel.refresh(CellRect { col: 0, row: r, cols, rows: 1 }, Waveform::Fast);
+}
+
 /// Returns the remote exit status if the far end ended the session quickly
-/// (used for the tmux fallback), None otherwise.
+/// (used for the tmux fallback), None otherwise. Reconnects on its own when
+/// the link drops; a tap on Home while waiting cancels.
 fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, key_path: &Path, command: Option<String>, margin: u32) -> Result<Option<i32>> {
     let ui = panel.region_full(UI_FONT, margin);
     panel.use_region(ui);
@@ -345,32 +380,82 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
     draw::text(panel, 1, 1, &format!("connecting to {} ({})...", entry.name, entry.spec), true, false);
     panel.refresh(CellRect { col: 0, row: 0, cols: ui.cols, rows: 3 }, Waveform::Fast);
 
-    let mut osk = Osk::new(ui.cols, 0);
-    let mut layout = Layout::compute(panel, margin, true, osk.height());
+    let osk = Osk::new(ui.cols, 0);
+    let layout = Layout::compute(panel, margin, true, osk.height());
     let target = SshTarget::parse(&entry.spec, key_path, command)?;
-    let mut tr = SshTransport::connect(target, layout.term.cols, layout.term.rows)?;
-    let mut term = Terminal::new(layout.term.cols, layout.term.rows, 5000);
-    panel.clear()?;
-    let t0 = Instant::now();
-    let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
-    let mut renderer = relayout(panel, &layout, &osk, &mut term, &mut tr, ms(t0))?;
+    let term = Terminal::new(layout.term.cols, layout.term.rows, 5000);
+    let renderer = Renderer::new(Config::default(), layout.term.cols, layout.term.rows);
+    let mut st = SessionState { layout, osk, term, renderer, pending_release: Vec::new(), finger_down: None, t0: Instant::now() };
 
+    let mut attempt = 0u32;
+    let mut first = true;
+    loop {
+        match SshTransport::connect(target.clone(), st.layout.term.cols, st.layout.term.rows) {
+            Ok(mut tr) => {
+                attempt = 0;
+                if first {
+                    panel.clear()?;
+                    first = false;
+                }
+                st.renderer = relayout(panel, &st.layout, &st.osk, &mut st.term, &mut tr, ms(st.t0))?;
+                let started = ms(st.t0);
+                match run_session(panel, touch, &mut st, &mut tr)? {
+                    End::Home => return Ok(None),
+                    End::Exit(code) => {
+                        if code == 127 && ms(st.t0) - started < 5000 {
+                            return Ok(Some(code));
+                        }
+                        banner(panel, &st, &format!("[session ended ({code}); tap to go home]"));
+                        wait_tap(panel, touch, Duration::from_secs(3600));
+                        return Ok(Some(code));
+                    }
+                    End::Lost => {}
+                }
+            }
+            Err(e) => {
+                if first {
+                    // Never got in at all: report on the home screen instead of retrying.
+                    return Err(e);
+                }
+                eprintln!("reconnect failed: {e:#}");
+            }
+        }
+        attempt += 1;
+        let delay = 2u64.pow(attempt.min(4)).min(30);
+        banner(panel, &st, &format!("[connection lost; reconnecting in {delay}s, tap Hom to stop]"));
+        let until = Instant::now() + Duration::from_secs(delay);
+        while Instant::now() < until {
+            for ev in touch.poll(Duration::from_millis(50)) {
+                if let TouchEvent::Tap { x, y } = ev {
+                    if let Some((c, r)) = panel.cell_in(&st.layout.osk, x, y) {
+                        if st.layout.osk_visible && st.osk.hit(c, r).map(|k| st.osk.key_is_home(k)).unwrap_or(false) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+        banner(panel, &st, "[reconnecting...]");
+    }
+}
+
+fn run_session(panel: &mut FbinkPanel, touch: &mut TouchDevice, st: &mut SessionState, tr: &mut SshTransport) -> Result<End> {
+    let t0 = st.t0;
     let mut buf = [0u8; 8192];
-    let mut pending_release: Vec<(usize, u64)> = Vec::new();
-    let mut finger_down: Option<(i32, i32)> = None;
     loop {
         let n = tr.read(&mut buf, Duration::from_millis(10))?;
         if n > 0 {
-            term.feed(&buf[..n]);
+            st.term.feed(&buf[..n]);
         }
-        panel.use_region(layout.term);
-        let grid = term.snapshot();
-        renderer.tick(ms(t0), &grid, panel);
+        panel.use_region(st.layout.term);
+        let grid = st.term.snapshot();
+        st.renderer.tick(ms(t0), &grid, panel);
 
         let now = ms(t0);
-        if pending_release.iter().any(|&(_, at)| now >= at) {
-            panel.use_region(layout.osk);
-            pending_release.retain(|&(k, at)| {
+        if st.pending_release.iter().any(|&(_, at)| now >= at) {
+            panel.use_region(st.layout.osk);
+            let osk = &st.osk;
+            st.pending_release.retain(|&(k, at)| {
                 if now >= at {
                     osk.release(panel, k);
                     false
@@ -382,52 +467,52 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
 
         for ev in touch.poll(Duration::from_millis(0)) {
             match ev {
-                TouchEvent::Down { x, y } => finger_down = Some((x, y)),
+                TouchEvent::Down { x, y } => st.finger_down = Some((x, y)),
                 TouchEvent::Up { x, y } => {
-                    let Some((sx, sy)) = finger_down.take() else { continue };
+                    let Some((sx, sy)) = st.finger_down.take() else { continue };
                     let dy = y - sy;
                     let dx = x - sx;
-                    if dy.abs() >= SWIPE_MIN_PX && dy.abs() > dx.abs() && panel.cell_in(&layout.term, sx, sy).is_some() {
+                    if dy.abs() >= SWIPE_MIN_PX && dy.abs() > dx.abs() && panel.cell_in(&st.layout.term, sx, sy).is_some() {
                         // Swipe on the terminal: finger down = older content.
-                        let lines = (dy.abs() / layout.term.fh as i32).max(1);
+                        let lines = (dy.abs() / st.layout.term.fh as i32).max(1);
                         let older = dy > 0;
-                        let (col, row) = panel.cell_in(&layout.term, x, y).unwrap_or((0, 0));
-                        if let Some(bytes) = term.mouse_wheel_bytes(older, col, row) {
+                        let (col, row) = panel.cell_in(&st.layout.term, x, y).unwrap_or((0, 0));
+                        if let Some(bytes) = st.term.mouse_wheel_bytes(older, col, row) {
                             for _ in 0..lines {
                                 tr.write_all(&bytes)?;
                             }
                         } else {
-                            term.scroll_view(if older { lines } else { -lines });
+                            st.term.scroll_view(if older { lines } else { -lines });
                         }
                     }
                 }
                 TouchEvent::Tap { x, y } => {
-                    let osk_hit = if layout.osk_visible { panel.cell_in(&layout.osk, x, y).and_then(|(c, r)| osk.hit(c, r)) } else { None };
+                    let osk_hit = if st.layout.osk_visible { panel.cell_in(&st.layout.osk, x, y).and_then(|(c, r)| st.osk.hit(c, r)) } else { None };
                     let Some(k) = osk_hit else {
                         // Tap anywhere else toggles the keyboard with a full-page refresh.
-                        pending_release.clear();
-                        layout = Layout::compute(panel, margin, !layout.osk_visible, osk.height());
-                        renderer = relayout(panel, &layout, &osk, &mut term, &mut tr, ms(t0))?;
+                        st.pending_release.clear();
+                        st.layout = Layout::compute(panel, st.layout.margin, !st.layout.osk_visible, st.osk.height());
+                        st.renderer = relayout(panel, &st.layout, &st.osk, &mut st.term, tr, ms(t0))?;
                         continue;
                     };
-                    panel.use_region(layout.osk);
-                    osk.flash(panel, k);
-                    match osk.press(k) {
-                        OskAction::Home => return Ok(None),
+                    panel.use_region(st.layout.osk);
+                    st.osk.flash(panel, k);
+                    match st.osk.press(k) {
+                        OskAction::Home => return Ok(End::Home),
                         OskAction::Hide => {
-                            pending_release.clear();
-                            layout = Layout::compute(panel, margin, false, osk.height());
-                            renderer = relayout(panel, &layout, &osk, &mut term, &mut tr, ms(t0))?;
+                            st.pending_release.clear();
+                            st.layout = Layout::compute(panel, st.layout.margin, false, st.osk.height());
+                            st.renderer = relayout(panel, &st.layout, &st.osk, &mut st.term, tr, ms(t0))?;
                         }
                         OskAction::ModifierChanged => {
-                            osk.draw_modifiers(panel);
+                            st.osk.draw_modifiers(panel);
                         }
                         a => {
-                            let bytes = osk.bytes_for(a);
+                            let bytes = st.osk.bytes_for(a);
                             tr.write_all(&bytes)?;
-                            term.scroll_view(-100_000); // typing returns to the live view
-                            pending_release.push((k, ms(t0) + 120));
-                            osk.draw_modifiers(panel);
+                            st.term.scroll_view(-100_000); // typing returns to the live view
+                            st.pending_release.push((k, ms(t0) + 120));
+                            st.osk.draw_modifiers(panel);
                         }
                     }
                 }
@@ -435,18 +520,8 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
             }
         }
 
-        if let Some(st) = tr.exit_status() {
-            if st == 127 && ms(t0) < 5000 {
-                return Ok(Some(st));
-            }
-            panel.use_region(layout.term);
-            let grid = term.snapshot();
-            renderer.tick(ms(t0) + 10_000, &grid, panel);
-            let r = layout.term.rows.saturating_sub(1);
-            draw::text(panel, 1, r, &format!("[session ended ({st}); tap to go home]"), true, true);
-            panel.refresh(CellRect { col: 0, row: r, cols: layout.term.cols, rows: 1 }, Waveform::Fast);
-            wait_tap(panel, touch, Duration::from_secs(3600));
-            return Ok(Some(st));
+        if let Some(code) = tr.exit_status() {
+            return Ok(if code == LOST { End::Lost } else { End::Exit(code) });
         }
     }
 }

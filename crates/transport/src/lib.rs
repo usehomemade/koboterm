@@ -4,7 +4,7 @@
 //! in-process SSH transport can implement the same trait later.
 
 pub mod ssh;
-pub use ssh::{keygen, SshTarget, SshTransport};
+pub use ssh::{keygen, SshTarget, SshTransport, LOST};
 
 use anyhow::{bail, Context, Result};
 use std::ffi::CString;

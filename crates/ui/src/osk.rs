@@ -181,6 +181,10 @@ impl Osk {
         }
     }
 
+    pub fn key_is_home(&self, i: usize) -> bool {
+        self.keys[i].key == Key::Home
+    }
+
     pub fn hit(&self, col: u16, row: u16) -> Option<usize> {
         self.keys.iter().position(|p| p.rect.contains(col, row))
     }

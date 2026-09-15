@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 pub const SPLEEN_16X32: &str = include_str!("../assets/spleen-16x32.bdf");
 pub const SPLEEN_12X24: &str = include_str!("../assets/spleen-12x24.bdf");
+/// Symbol blocks of GNU Unifont (OFL 1.1), used for glyphs the main font lacks.
+pub const UNIFONT_SYMBOLS: &str = include_str!("../assets/unifont-symbols.hex");
 
 /// One glyph, one `u32` per row, MSB = leftmost pixel. Width <= 32.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +92,49 @@ impl Font {
             let y = y as u16;
             *r = if y == 2 || y == height - 3 { full } else if y > 2 && y < height - 3 { edge } else { 0 };
         }
-        Font { width, height, glyphs, fallback: Glyph { rows: fb } }
+        let mut font = Font { width, height, glyphs, fallback: Glyph { rows: fb } };
+        font.add_hex_fallbacks(UNIFONT_SYMBOLS);
+        font
+    }
+
+    /// Add glyphs from a Unifont `.hex` file for code points the font lacks,
+    /// fitted into this font's cell: integer-scaled up when there is room,
+    /// sampled down otherwise, and centred.
+    pub fn add_hex_fallbacks(&mut self, hex: &str) {
+        let (cw, ch) = (self.width as i32, self.height as i32);
+        for line in hex.lines() {
+            let Some((cp, bits)) = line.split_once(':') else { continue };
+            let Some(chr) = u32::from_str_radix(cp, 16).ok().and_then(char::from_u32) else { continue };
+            if self.glyphs.contains_key(&chr) {
+                continue;
+            }
+            let gw: i32 = match bits.len() {
+                32 => 8,
+                64 => 16,
+                _ => continue,
+            };
+            let per_row = (gw / 4) as usize;
+            let mut src = [0u16; 16];
+            for (i, r) in src.iter_mut().enumerate() {
+                *r = u16::from_str_radix(&bits[i * per_row..(i + 1) * per_row], 16).unwrap_or(0) << (16 - gw);
+            }
+            let scale = (cw / gw).min(ch / 16).max(1);
+            let (dw, dh) = if cw >= gw { (gw * scale, 16 * scale) } else { (cw, 16.min(ch)) };
+            let (x0, y0) = ((cw - dw) / 2, (ch - dh) / 2);
+            let mut rows = vec![0u32; ch as usize];
+            for dy in 0..dh {
+                let sy = if cw >= gw { dy / scale } else { dy * 16 / dh } as usize;
+                let mut out = 0u32;
+                for dx in 0..dw {
+                    let sx = if cw >= gw { dx / scale } else { dx * gw / dw };
+                    if src[sy] & (1 << (15 - sx)) != 0 {
+                        out |= 1 << (31 - (x0 + dx));
+                    }
+                }
+                rows[(y0 + dy) as usize] = out;
+            }
+            self.glyphs.insert(chr, Glyph { rows });
+        }
     }
 
     /// Pixel-double every glyph (16x32 from 8x16, 24x48 from 12x24).
@@ -168,6 +212,23 @@ mod tests {
         let f = Font::from_bdf(SPLEEN_16X32);
         let rows = render(&f, '│');
         assert!(rows.iter().all(|r| r.contains('#')), "box-drawing must be continuous: {rows:#?}");
+    }
+
+    #[test]
+    fn claude_code_markers_come_from_unifont() {
+        for src in [SPLEEN_16X32, SPLEEN_12X24] {
+            let f = Font::from_bdf(src);
+            for ch in ['\u{23FA}', '\u{273B}', '\u{23BF}', '\u{2713}', '\u{2801}', '\u{2026}', '\u{00E9}'] {
+                assert!(f.has(ch), "{ch:?} missing at {}x{}", f.width, f.height);
+                let g = f.glyph(ch);
+                assert!(g.rows.iter().any(|r| *r != 0), "{ch:?} is blank");
+                assert_ne!(g, &f.fallback);
+            }
+        }
+        // 16x32: a halfwidth Unifont glyph is doubled to fill the cell exactly.
+        let f = Font::from_bdf(SPLEEN_16X32);
+        let rows = render(&f, '\u{2026}');
+        assert!(rows[0].len() == 16 && rows.iter().any(|r| r.contains("##")));
     }
 
     #[test]

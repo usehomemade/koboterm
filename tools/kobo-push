@@ -32,5 +32,7 @@ for part in "$WORK"/part.*; do
   [ "$ok" = 1 ] || { echo "push FAILED at chunk $n" >&2; exit 1; }
 done
 want="$(md5_of "$SRC")"
-got="$( printf "cat '%s'.parts.part.* > '%s' && rm -f '%s'.parts.* && chmod +x '%s' && md5sum '%s'\n" "$DST" "$DST" "$DST" "$DST" "$DST" | "$HERE/kobo-sh" | grep -oE '^[0-9a-f]{32}' || true )"
+# Assemble next to the target and rename over it, so a running binary is not
+# written in place (ETXTBSY) and readers never see a half-written file.
+got="$( printf "cat '%s'.parts.part.* > '%s.tmp' && rm -f '%s'.parts.* && chmod +x '%s.tmp' && mv -f '%s.tmp' '%s' && md5sum '%s'\n" "$DST" "$DST" "$DST" "$DST" "$DST" "$DST" "$DST" | "$HERE/kobo-sh" | grep -oE '^[0-9a-f]{32}' || true )"
 [ "$got" = "$want" ] && echo "pushed $SRC -> $DST (md5 ok)" || { echo "push FAILED: final checksum mismatch" >&2; exit 1; }

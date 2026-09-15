@@ -1,0 +1,6 @@
+unifont-symbols.hex is a subset of GNU Unifont 17.0.05 (https://unifoundry.com/unifont/),
+Copyright (C) 1998-2025 Roman Czyborra, Paul Hardy, et al.
+
+GNU Unifont is dual-licensed: under the GNU General Public License version 2
+or later with the GNU font embedding exception, and under the SIL Open Font
+License version 1.1. koboterm uses it under the SIL OFL 1.1.

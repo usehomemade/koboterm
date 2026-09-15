@@ -5,8 +5,66 @@
 
 use std::collections::HashMap;
 
-pub const SPLEEN_16X32: &str = include_str!("../assets/spleen-16x32.bdf");
+pub const SPLEEN_8X16: &str = include_str!("../assets/spleen-8x16.bdf");
 pub const SPLEEN_12X24: &str = include_str!("../assets/spleen-12x24.bdf");
+pub const SPLEEN_16X32: &str = include_str!("../assets/spleen-16x32.bdf");
+pub const SPLEEN_32X64: &str = include_str!("../assets/spleen-32x64.bdf");
+pub const TERMINUS_8X16: &str = include_str!("../assets/ter-u16n.bdf");
+pub const TERMINUS_10X20: &str = include_str!("../assets/ter-u20n.bdf");
+pub const TERMINUS_12X24: &str = include_str!("../assets/ter-u24n.bdf");
+pub const TERMINUS_14X28: &str = include_str!("../assets/ter-u28n.bdf");
+pub const TERMINUS_16X32: &str = include_str!("../assets/ter-u32n.bdf");
+
+/// A font family with a list of pixel sizes (some produced by 2x scaling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    Spleen,
+    Terminus,
+}
+
+impl Family {
+    pub const ALL: [Family; 2] = [Family::Spleen, Family::Terminus];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Spleen => "Spleen",
+            Family::Terminus => "Terminus",
+        }
+    }
+
+    pub fn parse(s: &str) -> Family {
+        match s.to_ascii_lowercase().as_str() {
+            "terminus" => Family::Terminus,
+            _ => Family::Spleen,
+        }
+    }
+
+    /// (source, scale) per size step, smallest first.
+    fn steps(self) -> &'static [(&'static str, u8)] {
+        match self {
+            Family::Spleen => &[(SPLEEN_8X16, 1), (SPLEEN_12X24, 1), (SPLEEN_16X32, 1), (SPLEEN_12X24, 2), (SPLEEN_32X64, 1)],
+            Family::Terminus => &[(TERMINUS_8X16, 1), (TERMINUS_10X20, 1), (TERMINUS_12X24, 1), (TERMINUS_14X28, 1), (TERMINUS_16X32, 1), (TERMINUS_12X24, 2), (TERMINUS_16X32, 2)],
+        }
+    }
+
+    pub fn size_count(self) -> usize {
+        self.steps().len()
+    }
+
+    /// Cell size in pixels of size step `idx`, without parsing the font.
+    pub fn cell_size(self, idx: usize) -> (u16, u16) {
+        let (src, scale) = self.steps()[idx.min(self.size_count() - 1)];
+        let line = src.lines().find(|l| l.starts_with("FONTBOUNDINGBOX ")).unwrap_or("FONTBOUNDINGBOX 8 16 0 0");
+        let v: Vec<u16> = line.split_whitespace().skip(1).take(2).map(|x| x.parse().unwrap_or(8)).collect();
+        (v[0] * scale as u16, v[1] * scale as u16)
+    }
+
+    pub fn load(self, idx: usize) -> Font {
+        let (src, scale) = self.steps()[idx.min(self.size_count() - 1)];
+        let f = Font::from_bdf(src);
+        if scale == 2 { f.scaled_2x() } else { f }
+    }
+}
 /// Symbol blocks of GNU Unifont (OFL 1.1), used for glyphs the main font lacks.
 pub const UNIFONT_SYMBOLS: &str = include_str!("../assets/unifont-symbols.hex");
 
@@ -246,6 +304,19 @@ mod tests {
         assert_eq!(a.len(), 48);
         assert_eq!(a[0], a[1], "rows come in identical pairs");
         assert!(a.iter().any(|r| r.contains("##") && !r.contains("#.#")), "columns are doubled");
+    }
+
+    #[test]
+    fn families_load_every_size_with_box_drawing() {
+        for fam in Family::ALL {
+            for i in 0..fam.size_count() {
+                let f = fam.load(i);
+                assert_eq!((f.width, f.height), fam.cell_size(i), "{fam:?} step {i}");
+                assert!(f.has('│') && f.has('A') && f.has('\u{23FA}'), "{fam:?} step {i}");
+            }
+        }
+        assert_eq!(Family::Terminus.cell_size(4), (16, 32));
+        assert_eq!(Family::Spleen.cell_size(3), (24, 48));
     }
 
     #[test]

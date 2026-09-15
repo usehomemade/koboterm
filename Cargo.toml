@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/panel", "crates/term", "crates/render", "crates/font", "crates/transport", "crates/input", "crates/ui", "crates/fbink-sys", "crates/panel-fbink", "crates/koboterm"]
+members = ["crates/panel", "crates/term", "crates/render", "crates/font", "crates/transport", "crates/input", "crates/ui", "crates/px", "crates/pxui", "crates/fbink-sys", "crates/panel-fbink", "crates/koboterm"]
 
 [workspace.package]
 version = "0.0.1"
@@ -15,6 +15,8 @@ font = { path = "crates/font" }
 transport = { path = "crates/transport" }
 input = { path = "crates/input" }
 ui = { path = "crates/ui" }
+px = { path = "crates/px" }
+pxui = { path = "crates/pxui" }
 fbink-sys = { path = "crates/fbink-sys" }
 panel-fbink = { path = "crates/panel-fbink" }
 cc = "1"

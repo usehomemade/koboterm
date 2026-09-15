@@ -1,0 +1,8 @@
+[package]
+name = "px"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+[dependencies]
+fontdue = "0.9"

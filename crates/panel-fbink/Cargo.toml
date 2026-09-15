@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 panel.workspace = true
+px.workspace = true
 font.workspace = true
 anyhow.workspace = true
 

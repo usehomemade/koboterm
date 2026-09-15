@@ -9,9 +9,8 @@ pub const TOPBAR_ROWS: u16 = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopAction {
     Home,
-    BrightnessDown,
-    BrightnessUp,
-    TextSize,
+    Brightness,
+    Text,
     Keyboard,
     Nothing,
 }
@@ -33,10 +32,9 @@ pub struct TopBar {
 impl TopBar {
     pub fn new(cols: u16) -> Self {
         // Right-aligned buttons, 6 cells wide, 2 rows tall, one gap column.
-        let specs: [(TopAction, &'static str); 4] = [
-            (TopAction::BrightnessDown, "☼-"),
-            (TopAction::BrightnessUp, "☼+"),
-            (TopAction::TextSize, "Aa"),
+        let specs: [(TopAction, &'static str); 3] = [
+            (TopAction::Brightness, "☼"),
+            (TopAction::Text, "Aa"),
             (TopAction::Keyboard, "⌨"),
         ];
         let w = 6u16;
@@ -124,7 +122,8 @@ mod tests {
             assert!(fp.row_text(2).contains("Home"));
             assert_eq!(tb.hit(2, 2), TopAction::Home);
             assert_eq!(tb.hit(cols - 3, 2), TopAction::Keyboard);
-            assert_eq!(tb.hit(cols - 10, 1), TopAction::TextSize);
+            assert_eq!(tb.hit(cols - 10, 1), TopAction::Text);
+            assert_eq!(tb.hit(cols - 17, 1), TopAction::Brightness);
             assert_eq!(tb.hit(20, 0), TopAction::Nothing);
         }
     }

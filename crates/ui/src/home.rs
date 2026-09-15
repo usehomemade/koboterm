@@ -71,7 +71,8 @@ pub enum HomeAction {
     Connect(usize),
     Add,
     Quit,
-    Size(TextSize),
+    Text,
+    Brightness,
     Nothing,
 }
 
@@ -101,25 +102,23 @@ impl Home {
         CellRect { col: self.cols - 9, row: self.rows - 4, cols: 8, rows: 3 }
     }
 
-    fn size_rect(&self, s: TextSize) -> CellRect {
-        let i = match s {
-            TextSize::Small => 0,
-            TextSize::Medium => 1,
-            TextSize::Large => 2,
-        };
-        CellRect { col: self.cols - 16 + i * 5, row: 0, cols: 5, rows: 3 }
+    fn text_rect(&self) -> CellRect {
+        CellRect { col: self.cols - 13, row: 0, cols: 6, rows: 3 }
     }
 
-    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], pubkey: &str, pair_url: &str, status: &str, size: TextSize) {
+    fn brightness_rect(&self) -> CellRect {
+        CellRect { col: self.cols - 6, row: 0, cols: 6, rows: 3 }
+    }
+
+    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], pubkey: &str, pair_url: &str, status: &str) {
         self.n = hosts.len();
         let full = CellRect { col: 0, row: 0, cols: self.cols, rows: self.rows };
         draw::fill(panel, full, ' ', false);
         draw::text(panel, 1, 1, "koboterm", true, false);
         let status: String = status.chars().take(self.cols.saturating_sub(28) as usize).collect();
         draw::text(panel, 11, 1, &status, false, false);
-        for (s, l) in [(TextSize::Small, "S"), (TextSize::Medium, "M"), (TextSize::Large, "L")] {
-            draw::button(panel, self.size_rect(s), l, s == size);
-        }
+        draw::button(panel, self.text_rect(), "Aa", false);
+        draw::button(panel, self.brightness_rect(), "☼", false);
         draw::text(panel, 1, 4, "Machines", false, false);
         for (i, h) in hosts.iter().enumerate() {
             let r = self.entry_rect(i);
@@ -164,10 +163,11 @@ impl Home {
         if self.quit_rect().contains(col, row) {
             return HomeAction::Quit;
         }
-        for s in [TextSize::Small, TextSize::Medium, TextSize::Large] {
-            if self.size_rect(s).contains(col, row) {
-                return HomeAction::Size(s);
-            }
+        if self.text_rect().contains(col, row) {
+            return HomeAction::Text;
+        }
+        if self.brightness_rect().contains(col, row) {
+            return HomeAction::Brightness;
         }
         HomeAction::Nothing
     }
@@ -329,20 +329,20 @@ mod tests {
         let mut fp = FakePanel::new(67, 45);
         let mut h = Home::new(67, 45);
         let hosts = vec![HostEntry { name: "MacBook".into(), spec: "tunc@10.0.0.2".into(), command: None }];
-        h.draw(&mut fp, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "", TextSize::Medium);
+        h.draw(&mut fp, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
         assert!((0..45).any(|r| fp.row_text(r).contains("curl -fsSL http://10.0.0.9:8080/install.sh | sh")));
         assert!(fp.row_text(6).contains("MacBook"));
         assert!(fp.row_text(6).contains("tunc@10.0.0.2"));
         assert_eq!(h.hit(10, 6), HomeAction::Connect(0));
         assert_eq!(h.hit(10, 9), HomeAction::Add);
         assert_eq!(h.hit(62, 42), HomeAction::Quit);
-        assert_eq!(h.hit(53, 1), HomeAction::Size(TextSize::Small));
-        assert_eq!(h.hit(63, 1), HomeAction::Size(TextSize::Large));
+        assert_eq!(h.hit(55, 1), HomeAction::Text);
+        assert_eq!(h.hit(63, 1), HomeAction::Brightness);
         assert_eq!(h.hit(30, 30), HomeAction::Nothing);
         // Small grid (large text) still lays out without panicking.
         let mut fp2 = FakePanel::new(43, 29);
         let mut h2 = Home::new(43, 29);
-        h2.draw(&mut fp2, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "", TextSize::Large);
+        h2.draw(&mut fp2, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
         assert!(fp2.row_text(6).contains("MacBook"));
         assert_eq!(fp.count(Waveform::Full), 1);
     }

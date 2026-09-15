@@ -13,6 +13,8 @@ use term::Terminal;
 use transport::{SshTarget, SshTransport, Transport};
 use ui::{draw, AddForm, FormAction, Home, HomeAction, HostEntry, Osk, OskAction, OSK_ROWS};
 
+use crate::pair::PairServer;
+
 const TOUCH_DEV: &str = "/dev/input/event1";
 
 fn data_dir() -> PathBuf {
@@ -51,25 +53,48 @@ pub fn run() -> Result<()> {
     let mut touch = TouchDevice::open(TOUCH_DEV, map).context("touch device")?;
     touch.grab(true).context("grab touch")?;
 
-    let result = main_loop(&mut panel, &mut touch, &mut hosts, &hosts_path, &key_path, &pubkey);
+    let pair = match PairServer::start(&pubkey) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("pairing server unavailable: {e}");
+            None
+        }
+    };
+    let result = main_loop(&mut panel, &mut touch, &mut hosts, &hosts_path, &key_path, &pubkey, pair.as_ref());
 
     let _ = touch.grab(false);
     panel.restore_screen(&saved);
     result
 }
 
+enum Wait {
+    Tap(u16, u16),
+    Registered(HostEntry),
+    Timeout,
+}
+
 fn wait_tap(panel: &FbinkPanel, touch: &mut TouchDevice, timeout: Duration) -> Option<(u16, u16)> {
+    match wait_event(panel, touch, None, timeout) {
+        Wait::Tap(c, r) => Some((c, r)),
+        _ => None,
+    }
+}
+
+fn wait_event(panel: &FbinkPanel, touch: &mut TouchDevice, pair: Option<&PairServer>, timeout: Duration) -> Wait {
     let start = Instant::now();
     while start.elapsed() < timeout {
+        if let Some(e) = pair.and_then(|p| p.try_recv()) {
+            return Wait::Registered(e);
+        }
         for ev in touch.poll(Duration::from_millis(50)) {
             if let TouchEvent::Tap { x, y } = ev {
-                if let Some(c) = panel.cell_at(x, y) {
-                    return Some(c);
+                if let Some((c, r)) = panel.cell_at(x, y) {
+                    return Wait::Tap(c, r);
                 }
             }
         }
     }
-    None
+    Wait::Timeout
 }
 
 fn main_loop(
@@ -79,14 +104,29 @@ fn main_loop(
     hosts_path: &std::path::Path,
     key_path: &std::path::Path,
     pubkey: &str,
+    pair: Option<&PairServer>,
 ) -> Result<()> {
     let g = panel.geometry();
     let mut home = Home::new(g.cols, g.rows);
     let mut status = String::new();
+    let pair_url = pair.map(|p| p.url.clone()).unwrap_or_else(|| "http://<kobo-ip>:8080".into());
     loop {
-        home.draw(panel, hosts, pubkey, &status);
+        home.draw(panel, hosts, pubkey, &pair_url, &status);
         status.clear();
-        let Some((col, row)) = wait_tap(panel, touch, Duration::from_secs(3600)) else { continue };
+        let (col, row) = match wait_event(panel, touch, pair, Duration::from_secs(3600)) {
+            Wait::Tap(c, r) => (c, r),
+            Wait::Registered(e) => {
+                // Replace an entry with the same name, otherwise append.
+                match hosts.iter().position(|h| h.name == e.name) {
+                    Some(i) => hosts[i] = e.clone(),
+                    None => hosts.push(e.clone()),
+                }
+                HostEntry::save(hosts_path, hosts)?;
+                status = format!("added {}", e.name);
+                continue;
+            }
+            Wait::Timeout => continue,
+        };
         match home.hit(col, row) {
             HomeAction::Quit => return Ok(()),
             HomeAction::Add => {
@@ -168,7 +208,20 @@ fn add_form(panel: &mut FbinkPanel, touch: &mut TouchDevice) -> Result<Option<Ho
     }
 }
 
+/// Connect; if the remote command (tmux) is missing, fall back to a plain shell.
 fn session(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, key_path: &std::path::Path) -> Result<()> {
+    match session_with(panel, touch, entry, key_path, entry.command.clone())? {
+        Some(127) if entry.command.is_some() => {
+            eprintln!("remote command {:?} not found; falling back to a login shell", entry.command);
+            session_with(panel, touch, entry, key_path, None).map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Returns the remote exit status if the far end ended the session quickly
+/// (used for the tmux fallback), None otherwise.
+fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, key_path: &std::path::Path, command: Option<String>) -> Result<Option<i32>> {
     let g = panel.geometry();
     panel.clear()?;
     draw::text(panel, 1, 1, &format!("connecting to {} ({})...", entry.name, entry.spec), true, false);
@@ -176,7 +229,7 @@ fn session(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, k
 
     let mut osk_visible = true;
     let mut term_rows = g.rows - OSK_ROWS;
-    let target = SshTarget::parse(&entry.spec, key_path, entry.command.clone())?;
+    let target = SshTarget::parse(&entry.spec, key_path, command)?;
     let mut tr = SshTransport::connect(target, g.cols, term_rows)?;
     let mut term = Terminal::new(g.cols, term_rows, 0);
     let mut renderer = Renderer::new(Config::default(), g.cols, term_rows);
@@ -206,28 +259,36 @@ fn session(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, k
         for ev in touch.poll(Duration::from_millis(0)) {
             let TouchEvent::Tap { x, y } = ev else { continue };
             let Some((col, row)) = panel.cell_at(x, y) else { continue };
-            if !osk_visible {
-                // Any tap on the terminal brings the keyboard back.
-                osk_visible = true;
-                term_rows = g.rows - OSK_ROWS;
+            let on_osk = osk_visible && osk.hit(col, row).is_some();
+            if !on_osk {
+                // A tap on the terminal toggles the keyboard, with a full-page refresh.
+                osk_visible = !osk_visible;
+                term_rows = if osk_visible { g.rows - OSK_ROWS } else { g.rows };
                 term.resize(g.cols, term_rows);
                 tr.resize(g.cols, term_rows)?;
                 renderer = Renderer::new(Config::default(), g.cols, term_rows);
-                panel.clear()?;
-                osk.draw(panel);
+                draw::fill(panel, CellRect { col: 0, row: 0, cols: g.cols, rows: g.rows }, ' ', false);
+                if osk_visible {
+                    osk.draw(panel);
+                }
+                let grid = term.snapshot();
+                renderer.redraw_full(ms(t0), &grid, panel);
+                pending_release = None;
                 continue;
             }
             let Some(k) = osk.hit(col, row) else { continue };
             osk.flash(panel, k);
             match osk.press(k) {
-                OskAction::Home => return Ok(()),
+                OskAction::Home => return Ok(None),
                 OskAction::Hide => {
                     osk_visible = false;
                     term_rows = g.rows;
                     term.resize(g.cols, term_rows);
                     tr.resize(g.cols, term_rows)?;
                     renderer = Renderer::new(Config::default(), g.cols, term_rows);
-                    panel.clear()?;
+                    draw::fill(panel, CellRect { col: 0, row: 0, cols: g.cols, rows: g.rows }, ' ', false);
+                    let grid = term.snapshot();
+                    renderer.redraw_full(ms(t0), &grid, panel);
                     pending_release = None;
                 }
                 OskAction::ModifierChanged => {
@@ -245,12 +306,15 @@ fn session(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, k
         }
 
         if let Some(st) = tr.exit_status() {
+            if st == 127 && ms(t0) < 5000 {
+                return Ok(Some(st));
+            }
             let grid = term.snapshot();
             renderer.tick(ms(t0) + 10_000, &grid, panel);
             draw::text(panel, 1, term_rows.saturating_sub(1), &format!("[session ended ({st}); tap to go home]"), true, true);
             panel.refresh(CellRect { col: 0, row: term_rows.saturating_sub(1), cols: g.cols, rows: 1 }, Waveform::Fast);
             wait_tap(panel, touch, Duration::from_secs(3600));
-            return Ok(());
+            return Ok(Some(st));
         }
     }
 }

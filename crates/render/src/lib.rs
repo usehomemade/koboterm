@@ -29,6 +29,10 @@ pub struct Config {
     /// When idle this long with at least `ghost_idle_min_partials`, do a Full refresh.
     pub ghost_idle_ms: u64,
     pub ghost_idle_min_partials: u32,
+    /// Re-push the whole grid with a Fast refresh if nothing was refreshed for
+    /// this long. Cheap on e-ink (unchanged pixels do not move) and guarantees
+    /// the glass never lags the model by more than this. 0 disables.
+    pub heartbeat_ms: u64,
 }
 
 impl Default for Config {
@@ -40,6 +44,7 @@ impl Default for Config {
             ghost_budget: 40,
             ghost_idle_ms: 4000,
             ghost_idle_min_partials: 6,
+            heartbeat_ms: 1000,
         }
     }
 }
@@ -119,7 +124,30 @@ impl Renderer {
             self.full(now, panel);
             return Flushed::Full;
         }
+        if self.cfg.heartbeat_ms > 0 && now.saturating_sub(self.last_flush) >= self.cfg.heartbeat_ms {
+            let (cols, rows) = (self.shadow.cols, self.shadow.rows);
+            panel.refresh(CellRect { col: 0, row: 0, cols, rows }, Waveform::Fast);
+            self.last_flush = now;
+            return Flushed::Partial(1);
+        }
         Flushed::Nothing
+    }
+
+    /// Draw every cell of `grid` and push one flashing Full refresh. Use after
+    /// the layout changed underneath (keyboard shown/hidden).
+    pub fn redraw_full(&mut self, now: u64, grid: &Grid, panel: &mut dyn Panel) {
+        let wanted = Self::wanted(grid);
+        for r in 0..wanted.rows {
+            for c in 0..wanted.cols {
+                panel.draw(c, r, wanted.cell(c, r));
+            }
+        }
+        panel.refresh(CellRect { col: 0, row: 0, cols: wanted.cols, rows: wanted.rows }, Waveform::Full);
+        self.shadow = wanted.clone();
+        self.last_wanted = wanted;
+        self.pending_since = None;
+        self.partials_since_full = 0;
+        self.last_flush = now;
     }
 
     fn full(&mut self, now: u64, panel: &mut dyn Panel) {
@@ -218,6 +246,7 @@ mod tests {
 
     impl Sim {
         fn new(cols: u16, rows: u16, cfg: Config) -> Self {
+            let cfg = Config { heartbeat_ms: 0, ..cfg };
             Sim { term: Terminal::new(cols, rows, 0), panel: FakePanel::new(cols, rows), r: Renderer::new(cfg, cols, rows), now: 0 }
         }
         fn feed(&mut self, b: &[u8]) {
@@ -319,6 +348,19 @@ mod tests {
         s.run(5000);
         assert_eq!(s.panel.count(Waveform::Full), 1, "idle full refresh must not repeat");
         assert_eq!(s.panel.row_text(0), "xxxx");
+    }
+
+    #[test]
+    fn heartbeat_repushes_the_grid_once_a_second_when_idle() {
+        let mut s = Sim::new(60, 20, Config::default());
+        s.r = Renderer::new(Config { heartbeat_ms: 1000, ghost_idle_ms: 1_000_000, ..Config::default() }, 60, 20);
+        s.feed(b"x");
+        s.run(100);
+        let before = s.panel.total_refreshes();
+        s.run(3050);
+        let hb = s.panel.total_refreshes() - before;
+        assert_eq!(hb, 3, "expected one heartbeat per idle second");
+        assert!(s.panel.refreshes[before..].iter().all(|(r, w)| *w == Waveform::Fast && r.rows == 20));
     }
 
     #[test]

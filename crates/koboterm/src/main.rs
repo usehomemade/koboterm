@@ -6,6 +6,8 @@ use anyhow::Result;
 
 #[cfg(target_os = "linux")]
 mod app;
+#[cfg(target_os = "linux")]
+mod pair;
 
 fn main() -> Result<()> {
     let cmd = std::env::args().nth(1).unwrap_or_default();

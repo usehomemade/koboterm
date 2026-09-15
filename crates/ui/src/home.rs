@@ -76,7 +76,7 @@ impl Home {
         CellRect { col: self.cols - 9, row: self.rows - 4, cols: 8, rows: 3 }
     }
 
-    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], pubkey: &str, status: &str) {
+    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], pubkey: &str, pair_url: &str, status: &str) {
         self.n = hosts.len();
         let full = CellRect { col: 0, row: 0, cols: self.cols, rows: self.rows };
         draw::fill(panel, full, ' ', false);
@@ -91,8 +91,10 @@ impl Home {
             draw::text(panel, spec_col.max(r.col + 3 + h.name.chars().count() as u16), r.row + 1, &h.spec, false, false);
         }
         draw::button(panel, self.add_rect(), "+ add a machine", false);
-        let key_row = self.rows - 9;
-        draw::text(panel, 1, key_row, "This device's key. Add it to ~/.ssh/authorized_keys on your machine:", false, false);
+        let key_row = self.rows - 12;
+        draw::text(panel, 1, key_row - 3, "To add a machine automatically, run this on it:", false, false);
+        draw::text(panel, 1, key_row - 2, &format!("curl -fsSL {pair_url}/install.sh | sh"), true, false);
+        draw::text(panel, 1, key_row, "Or add this device's key to ~/.ssh/authorized_keys by hand:", false, false);
         let width = (self.cols - 2) as usize;
         let chars: Vec<char> = pubkey.trim().chars().collect();
         for (i, chunk) in chars.chunks(width).enumerate().take(3) {
@@ -275,7 +277,8 @@ mod tests {
         let mut fp = FakePanel::new(67, 45);
         let mut h = Home::new(67, 45);
         let hosts = vec![HostEntry { name: "MacBook".into(), spec: "tunc@10.0.0.2".into(), command: None }];
-        h.draw(&mut fp, &hosts, "ssh-ed25519 AAAAtest koboterm", "");
+        h.draw(&mut fp, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
+        assert!((0..45).any(|r| fp.row_text(r).contains("curl -fsSL http://10.0.0.9:8080/install.sh | sh")));
         assert!(fp.row_text(5).contains("MacBook"));
         assert!(fp.row_text(5).contains("tunc@10.0.0.2"));
         assert_eq!(h.hit(10, 5), HomeAction::Connect(0));

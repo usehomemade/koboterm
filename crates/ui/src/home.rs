@@ -43,15 +43,40 @@ impl HostEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextSize {
+    Small,
+    Medium,
+    Large,
+}
+
+impl TextSize {
+    pub fn parse(s: &str) -> TextSize {
+        match s {
+            "small" => TextSize::Small,
+            "large" => TextSize::Large,
+            _ => TextSize::Medium,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            TextSize::Small => "small",
+            TextSize::Medium => "medium",
+            TextSize::Large => "large",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HomeAction {
     Connect(usize),
     Add,
     Quit,
+    Size(TextSize),
     Nothing,
 }
 
 const ENTRY_H: u16 = 3;
-const LIST_TOP: u16 = 4;
+const LIST_TOP: u16 = 5;
 
 pub struct Home {
     cols: u16,
@@ -76,13 +101,26 @@ impl Home {
         CellRect { col: self.cols - 9, row: self.rows - 4, cols: 8, rows: 3 }
     }
 
-    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], pubkey: &str, pair_url: &str, status: &str) {
+    fn size_rect(&self, s: TextSize) -> CellRect {
+        let i = match s {
+            TextSize::Small => 0,
+            TextSize::Medium => 1,
+            TextSize::Large => 2,
+        };
+        CellRect { col: self.cols - 16 + i * 5, row: 0, cols: 5, rows: 3 }
+    }
+
+    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], pubkey: &str, pair_url: &str, status: &str, size: TextSize) {
         self.n = hosts.len();
         let full = CellRect { col: 0, row: 0, cols: self.cols, rows: self.rows };
         draw::fill(panel, full, ' ', false);
         draw::text(panel, 1, 1, "koboterm", true, false);
-        draw::text(panel, 11, 1, status, false, false);
-        draw::text(panel, 1, 3, "Machines", false, false);
+        let status: String = status.chars().take(self.cols.saturating_sub(28) as usize).collect();
+        draw::text(panel, 11, 1, &status, false, false);
+        for (s, l) in [(TextSize::Small, "S"), (TextSize::Medium, "M"), (TextSize::Large, "L")] {
+            draw::button(panel, self.size_rect(s), l, s == size);
+        }
+        draw::text(panel, 1, 4, "Machines", false, false);
         for (i, h) in hosts.iter().enumerate() {
             let r = self.entry_rect(i);
             draw::frame(panel, r, false);
@@ -91,15 +129,24 @@ impl Home {
             draw::text(panel, spec_col.max(r.col + 3 + h.name.chars().count() as u16), r.row + 1, &h.spec, false, false);
         }
         draw::button(panel, self.add_rect(), "+ add a machine", false);
-        let key_row = self.rows - 12;
-        draw::text(panel, 1, key_row - 3, "To add a machine automatically, run this on it:", false, false);
-        draw::text(panel, 1, key_row - 2, &format!("curl -fsSL {pair_url}/install.sh | sh"), true, false);
-        draw::text(panel, 1, key_row, "Or add this device's key to ~/.ssh/authorized_keys by hand:", false, false);
         let width = (self.cols - 2) as usize;
-        let chars: Vec<char> = pubkey.trim().chars().collect();
-        for (i, chunk) in chars.chunks(width).enumerate().take(3) {
-            let s: String = chunk.iter().collect();
-            draw::text(panel, 1, key_row + 1 + i as u16, &s, false, false);
+        let wrap = |s: &str| -> Vec<String> { s.chars().collect::<Vec<_>>().chunks(width).map(|c| c.iter().collect()).collect() };
+        let key_lines = wrap(pubkey.trim());
+        let curl_lines = wrap(&format!("curl -fsSL {pair_url}/install.sh | sh"));
+        let block = 2 + curl_lines.len() + 1 + key_lines.len();
+        let mut row = self.rows.saturating_sub(5 + block as u16).max(self.add_rect().row + ENTRY_H + 1);
+        draw::text(panel, 1, row, "To add a machine automatically, run this on it:", false, false);
+        row += 1;
+        for l in &curl_lines {
+            draw::text(panel, 1, row, l, true, false);
+            row += 1;
+        }
+        row += 1;
+        draw::text(panel, 1, row, "Or add this device's key to ~/.ssh/authorized_keys:", false, false);
+        row += 1;
+        for l in key_lines.iter().take(3) {
+            draw::text(panel, 1, row, l, false, false);
+            row += 1;
         }
         draw::button(panel, self.quit_rect(), "Quit", false);
         panel.refresh(full, Waveform::Full);
@@ -116,6 +163,11 @@ impl Home {
         }
         if self.quit_rect().contains(col, row) {
             return HomeAction::Quit;
+        }
+        for s in [TextSize::Small, TextSize::Medium, TextSize::Large] {
+            if self.size_rect(s).contains(col, row) {
+                return HomeAction::Size(s);
+            }
         }
         HomeAction::Nothing
     }
@@ -277,14 +329,21 @@ mod tests {
         let mut fp = FakePanel::new(67, 45);
         let mut h = Home::new(67, 45);
         let hosts = vec![HostEntry { name: "MacBook".into(), spec: "tunc@10.0.0.2".into(), command: None }];
-        h.draw(&mut fp, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
+        h.draw(&mut fp, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "", TextSize::Medium);
         assert!((0..45).any(|r| fp.row_text(r).contains("curl -fsSL http://10.0.0.9:8080/install.sh | sh")));
-        assert!(fp.row_text(5).contains("MacBook"));
-        assert!(fp.row_text(5).contains("tunc@10.0.0.2"));
-        assert_eq!(h.hit(10, 5), HomeAction::Connect(0));
-        assert_eq!(h.hit(10, 8), HomeAction::Add);
+        assert!(fp.row_text(6).contains("MacBook"));
+        assert!(fp.row_text(6).contains("tunc@10.0.0.2"));
+        assert_eq!(h.hit(10, 6), HomeAction::Connect(0));
+        assert_eq!(h.hit(10, 9), HomeAction::Add);
         assert_eq!(h.hit(62, 42), HomeAction::Quit);
+        assert_eq!(h.hit(53, 1), HomeAction::Size(TextSize::Small));
+        assert_eq!(h.hit(63, 1), HomeAction::Size(TextSize::Large));
         assert_eq!(h.hit(30, 30), HomeAction::Nothing);
+        // Small grid (large text) still lays out without panicking.
+        let mut fp2 = FakePanel::new(43, 29);
+        let mut h2 = Home::new(43, 29);
+        h2.draw(&mut fp2, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "", TextSize::Large);
+        assert!(fp2.row_text(6).contains("MacBook"));
         assert_eq!(fp.count(Waveform::Full), 1);
     }
 

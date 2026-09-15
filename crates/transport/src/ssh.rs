@@ -124,6 +124,9 @@ async fn session(
             bail!("public key authentication rejected for {}", target.user);
         }
         let channel = handle.channel_open_session().await?;
+        // Best effort: sshd only accepts these if AcceptEnv allows them (macOS does for LANG/LC_*).
+        let _ = channel.set_env(false, "LANG", "en_US.UTF-8").await;
+        let _ = channel.set_env(false, "LC_CTYPE", "en_US.UTF-8").await;
         channel.request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[]).await?;
         match &target.command {
             Some(c) => channel.exec(true, c.as_str()).await?,

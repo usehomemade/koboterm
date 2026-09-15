@@ -8,12 +8,14 @@ use anyhow::Result;
 mod app;
 #[cfg(target_os = "linux")]
 mod pair;
+#[cfg(target_os = "linux")]
+mod nickel;
 
 fn main() -> Result<()> {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
         #[cfg(target_os = "linux")]
-        "" | "app" => app::run(),
+        "" | "app" => app::run(std::env::args().skip(2).collect()),
         "probe" => probe(),
         #[cfg(target_os = "linux")]
         "demo" => demo::run(),

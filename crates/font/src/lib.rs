@@ -93,6 +93,27 @@ impl Font {
         Font { width, height, glyphs, fallback: Glyph { rows: fb } }
     }
 
+    /// Pixel-double every glyph (16x32 from 8x16, 24x48 from 12x24).
+    pub fn scaled_2x(&self) -> Font {
+        fn dbl(bits: u32, w: u16) -> u32 {
+            let mut out = 0u32;
+            for x in 0..w as u32 {
+                if bits & (1 << (31 - x)) != 0 {
+                    out |= 0b11 << (30 - 2 * x);
+                }
+            }
+            out
+        }
+        let w = self.width;
+        let scale = |g: &Glyph| Glyph { rows: g.rows.iter().flat_map(|r| [dbl(*r, w), dbl(*r, w)]).collect() };
+        Font {
+            width: self.width * 2,
+            height: self.height * 2,
+            glyphs: self.glyphs.iter().map(|(c, g)| (*c, scale(g))).collect(),
+            fallback: scale(&self.fallback),
+        }
+    }
+
     pub fn glyph(&self, ch: char) -> &Glyph {
         self.glyphs.get(&ch).unwrap_or(&self.fallback)
     }
@@ -154,6 +175,16 @@ mod tests {
         let f = Font::from_bdf(SPLEEN_16X32);
         assert!(!f.has('\u{10FFFF}'));
         assert_eq!(f.glyph('\u{10FFFF}'), &f.fallback);
+    }
+
+    #[test]
+    fn scaling_doubles_every_pixel() {
+        let f = Font::from_bdf(SPLEEN_12X24).scaled_2x();
+        assert_eq!((f.width, f.height), (24, 48));
+        let a = render(&f, 'A');
+        assert_eq!(a.len(), 48);
+        assert_eq!(a[0], a[1], "rows come in identical pairs");
+        assert!(a.iter().any(|r| r.contains("##") && !r.contains("#.#")), "columns are doubled");
     }
 
     #[test]

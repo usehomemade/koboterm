@@ -23,6 +23,8 @@ mod imp {
         geo: Geometry,
         x0: u32,
         y0: u32,
+        margin: u32,
+        view_origin: (u32, u32),
         pub device_name: String,
         pub view: (u32, u32),
         pub refreshes: [u32; 3],
@@ -37,6 +39,10 @@ mod imp {
 
     impl FbinkPanel {
         pub fn open(font: Font) -> Result<Self> {
+            Self::open_with_margin(font, 0)
+        }
+
+        pub fn open_with_margin(font: Font, margin: u32) -> Result<Self> {
             unsafe {
                 let fd = fb::fbink_open();
                 if fd < 0 {
@@ -54,10 +60,7 @@ mod imp {
                 if buf.is_null() {
                     bail!("fbink_get_fb_pointer returned null");
                 }
-                let cols = (st.view_width / font.width as u32) as u16;
-                let rows = (st.view_height / font.height as u32) as u16;
-                let x0 = st.view_hori_origin as u32 + (st.view_width - cols as u32 * font.width as u32) / 2;
-                let y0 = st.view_vert_origin as u32 + (st.view_height - rows as u32 * font.height as u32) / 2;
+                let (cols, rows, x0, y0) = Self::layout(&font, margin, st.view_width, st.view_height, st.view_hori_origin as u32, st.view_vert_origin as u32);
                 Ok(FbinkPanel {
                     fd,
                     cfg,
@@ -70,6 +73,8 @@ mod imp {
                     geo: Geometry { cols, rows },
                     x0,
                     y0,
+                    margin,
+                    view_origin: (st.view_hori_origin as u32, st.view_vert_origin as u32),
                     device_name: cstr(&st.device_name),
                     view: (st.view_width, st.view_height),
                     refreshes: [0; 3],
@@ -78,6 +83,25 @@ mod imp {
                     touch_mirror_y: st.touch_mirror_y,
                 })
             }
+        }
+
+        fn layout(font: &Font, margin: u32, vw: u32, vh: u32, ox: u32, oy: u32) -> (u16, u16, u32, u32) {
+            let (fw, fh) = (font.width as u32, font.height as u32);
+            let cols = (vw.saturating_sub(2 * margin) / fw) as u16;
+            let rows = (vh.saturating_sub(2 * margin) / fh) as u16;
+            let x0 = ox + (vw - cols as u32 * fw) / 2;
+            let y0 = oy + (vh - rows as u32 * fh) / 2;
+            (cols, rows, x0, y0)
+        }
+
+        /// Switch font (text size) and recompute the grid. Screen content is not redrawn.
+        pub fn set_font(&mut self, font: Font, margin: u32) {
+            let (cols, rows, x0, y0) = Self::layout(&font, margin, self.view.0, self.view.1, self.view_origin.0, self.view_origin.1);
+            self.font = font;
+            self.margin = margin;
+            self.geo = Geometry { cols, rows };
+            self.x0 = x0;
+            self.y0 = y0;
         }
 
         /// White the whole screen with a flashing full refresh.

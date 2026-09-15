@@ -6,5 +6,5 @@ pub mod draw;
 pub mod home;
 pub mod osk;
 
-pub use home::{AddForm, FormAction, Home, HomeAction, HostEntry};
-pub use osk::{Osk, OskAction, OSK_ROWS};
+pub use home::{AddForm, FormAction, Home, HomeAction, HostEntry, TextSize};
+pub use osk::{osk_rows, Osk, OskAction, OSK_ROWS};

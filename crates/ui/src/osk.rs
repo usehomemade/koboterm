@@ -4,10 +4,21 @@
 use crate::draw;
 use panel::{CellRect, Panel, Waveform};
 
+/// Rows the keyboard takes for a grid of this size.
+pub fn osk_rows(cols: u16, rows: u16) -> u16 {
+    5 * key_h(cols, rows)
+}
+/// Kept for callers that assume the 67x45 layout.
 pub const OSK_ROWS: u16 = 15;
-const SLOT_W: u16 = 5;
-const KEY_H: u16 = 3;
 const SLOTS: u16 = 13;
+
+fn slot_w(cols: u16) -> u16 {
+    (cols / SLOTS).clamp(3, 6)
+}
+/// Framed 3-row keys when there is room, compact 2-row keys on small grids.
+fn key_h(cols: u16, rows: u16) -> u16 {
+    if rows >= 40 && slot_w(cols) >= 5 { 3 } else { 2 }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
@@ -71,11 +82,25 @@ pub struct Osk {
     pub shift: bool,
     pub ctrl: bool,
     pub alt: bool,
+    framed: bool,
+    slot_w: u16,
 }
 
 impl Osk {
+    /// Keyboard at the bottom of a `cols` x `rows` grid.
+    pub fn bottom(cols: u16, rows: u16) -> Self {
+        Self::new_sized(cols, rows, rows - osk_rows(cols, rows))
+    }
+
+    /// Keyboard starting at `top_row` on the classic 67x45 grid.
     pub fn new(cols: u16, top_row: u16) -> Self {
-        let width = SLOTS * SLOT_W;
+        Self::new_sized(cols, 45, top_row)
+    }
+
+    fn new_sized(cols: u16, rows: u16, top_row: u16) -> Self {
+        let sw = slot_w(cols);
+        let kh = key_h(cols, rows);
+        let width = SLOTS * sw;
         let margin = cols.saturating_sub(width) / 2;
         let mut keys = Vec::new();
         for (ri, row) in ROWS.iter().enumerate() {
@@ -83,31 +108,37 @@ impl Osk {
             for s in row.iter() {
                 keys.push(Placed {
                     key: s.key,
-                    rect: CellRect { col: margin + slot * SLOT_W, row: top_row + ri as u16 * KEY_H, cols: s.span * SLOT_W, rows: KEY_H },
+                    rect: CellRect { col: margin + slot * sw, row: top_row + ri as u16 * kh, cols: s.span * sw, rows: kh },
                 });
                 slot += s.span;
             }
         }
-        Osk { keys, area: CellRect { col: 0, row: top_row, cols, rows: OSK_ROWS }, shift: false, ctrl: false, alt: false }
+        Osk { keys, area: CellRect { col: 0, row: top_row, cols, rows: 5 * kh }, shift: false, ctrl: false, alt: false, framed: kh == 3, slot_w: sw }
+    }
+
+    pub fn height(&self) -> u16 {
+        self.area.rows
     }
 
     fn label(&self, key: Key) -> String {
+        let narrow = self.slot_w < 5;
+        let pick = |long: &str, short: &str| if narrow { short } else { long }.to_string();
         match key {
             Key::Char(a, b) => (if self.shift { b } else { a }).to_string(),
-            Key::Esc => "Esc".into(),
-            Key::Tab => "Tab".into(),
-            Key::Enter => "Ent".into(),
-            Key::Backspace => "Bks".into(),
-            Key::Space => "space".into(),
+            Key::Esc => pick("Esc", "Es"),
+            Key::Tab => pick("Tab", "Tb"),
+            Key::Enter => pick("Ent", "En"),
+            Key::Backspace => pick("Bks", "Bs"),
+            Key::Space => pick("space", "sp"),
             Key::Up => "↑".into(),
             Key::Down => "↓".into(),
             Key::Left => "←".into(),
             Key::Right => "→".into(),
-            Key::Shift => "Sft".into(),
-            Key::Ctrl => "Ctl".into(),
-            Key::Alt => "Alt".into(),
-            Key::Hide => "Kbd".into(),
-            Key::Home => "Hom".into(),
+            Key::Shift => pick("Sft", "Sh"),
+            Key::Ctrl => pick("Ctl", "Ct"),
+            Key::Alt => pick("Alt", "Al"),
+            Key::Hide => pick("Kbd", "Kb"),
+            Key::Home => pick("Hom", "Hm"),
         }
     }
 
@@ -117,7 +148,18 @@ impl Osk {
 
     fn draw_key(&self, panel: &mut dyn Panel, i: usize, pressed: bool) {
         let p = self.keys[i];
-        draw::button(panel, p.rect, &self.label(p.key), pressed || self.is_active(p.key));
+        let on = pressed || self.is_active(p.key);
+        if self.framed {
+            draw::button(panel, p.rect, &self.label(p.key), on);
+        } else {
+            // Compact: label row inverted unless pressed, one blank gap row, one gap column.
+            let r = CellRect { col: p.rect.col, row: p.rect.row, cols: p.rect.cols.saturating_sub(1).max(1), rows: 1 };
+            draw::fill(panel, CellRect { rows: p.rect.rows, ..p.rect }, ' ', false);
+            draw::fill(panel, r, ' ', !on);
+            let label: String = self.label(p.key).chars().take(r.cols as usize).collect();
+            let pad = (r.cols as usize - label.chars().count()) / 2;
+            draw::text(panel, r.col + pad as u16, r.row, &label, false, !on);
+        }
     }
 
     /// Draw every key and refresh the keyboard area once.
@@ -270,6 +312,22 @@ mod tests {
         let cc = o.keys.iter().position(|p| p.key == Key::Char('c', 'C')).unwrap();
         let a = o.press(cc);
         assert_eq!(o.bytes_for(a), b"\x03");
+    }
+
+    #[test]
+    fn keyboard_fits_small_and_large_grids() {
+        for (cols, rows) in [(87u16, 58u16), (65, 44), (43, 29)] {
+            let o = Osk::bottom(cols, rows);
+            assert!(o.height() <= 15 && o.height() >= 10, "{cols}x{rows}: {}", o.height());
+            for p in &o.keys {
+                assert!(p.rect.col + p.rect.cols <= cols, "{cols}x{rows}: {p:?}");
+                assert!(p.rect.row + p.rect.rows <= rows, "{cols}x{rows}: {p:?}");
+            }
+            let mut fp = FakePanel::new(cols, rows);
+            o.draw(&mut fp);
+            let all: String = (o.area.row..rows).map(|r| fp.row_text(r)).collect::<Vec<_>>().join("\n");
+            assert!(all.contains('q') && all.contains('↑'), "{all}");
+        }
     }
 
     #[test]

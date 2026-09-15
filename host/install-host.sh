@@ -93,7 +93,8 @@ fi
 [ -n "$IP" ] || IP="$(hostname)"
 # Absolute path: ssh runs commands in a non-login shell whose PATH may lack Homebrew.
 CMD=""
-[ -n "$TMUX" ] && CMD="$TMUX new -A -s $SESSION"
+# -u: the Kobo is a UTF-8 terminal. mouse on: swipes on the Kobo scroll tmux history.
+[ -n "$TMUX" ] && CMD="$TMUX -u new -A -s $SESSION \\; set -g mouse on \\; set -g focus-events on"
 urlenc() { printf '%s' "$1" | od -An -tx1 -v | tr ' ' '\n' | grep -v '^$' | awk '{printf "%%%s", $1}'; }
 BODY="name=$(urlenc "$NAME")&spec=$(urlenc "$USER@$IP")&cmd=$(urlenc "$CMD")"
 if curl -fsS -X POST --data "$BODY" "$KOBO_URL/register" >/dev/null; then

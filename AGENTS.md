@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 koboterm — an SSH terminal client for Kobo e-readers. Sit with a Kobo, connect to a remote machine, and work in a terminal (the primary use case is running Claude Code over SSH). `CLAUDE.md` is a symlink to this file; edit `AGENTS.md`.
 
-**Status: first pixels.** Rust workspace; host-side tests for the terminal model, refresh scheduler and font. `koboterm demo` renders a scripted terminal session on the device through FBInk (67x45 cells at Spleen 16x32 on the Clara BW). No pty, no network, no input yet. License is GPL-3.0-or-later because FBInk is linked in.
+**Status: remote shell works, no input yet.** `koboterm ssh user@host` opens an SSH session from the Kobo and renders it on the e-ink screen (67x45 cells at Spleen 16x32 on the Clara BW); `koboterm run -- CMD` does the same for a local pty. Keystrokes can only be injected with `--type` so far: no keyboard, no launcher, no reconnect, no installer. License is GPL-3.0-or-later because FBInk is linked in.
 
 ## Commands
 
@@ -18,6 +18,8 @@ cargo zigbuild --release --target armv7-unknown-linux-musleabihf   # device bina
 tools/kobo-push target/armv7-unknown-linux-musleabihf/release/koboterm /tmp/koboterm   # deploy (about 1 min)
 echo "/tmp/koboterm probe" | tools/kobo-sh                                              # run on device
 echo "/tmp/koboterm demo" | tools/kobo-sh                                               # scripted session on the e-ink screen
+echo "/tmp/koboterm keygen" | tools/kobo-sh                                             # device key -> /mnt/onboard/.adds/koboterm/id_ed25519
+printf '/tmp/koboterm ssh tunc@192.168.0.199 --type "uname -a\\n" --type "exit\\n"\n' | tools/kobo-sh   # remote session (Mac with Remote Login on)
 ```
 
 `cargo` lives in `/opt/homebrew/opt/rustup/bin`; add that to PATH.
@@ -42,7 +44,8 @@ Verified 2026-09-15 by running `koboterm probe` on the device:
 - `crates/font` — BDF parser; ships Spleen 16x32 and 12x24 (BSD-2-Clause). Glyphs the font lacks render as a hollow box.
 - `crates/fbink-sys` — raw FFI to FBInk. `build.rs` copies `third_party/FBInk` (git submodule, pinned) into `OUT_DIR` and runs its Makefile (`staticlib KOBO=true MINIMAL=true DRAW=1`) with the compiler cargo resolved. Bindings are pre-generated with bindgen for the ARM target and committed. Empty crate on non-Linux hosts.
 - `crates/panel-fbink` — `FbinkPanel: Panel`. Writes glyphs straight into FBInk's mapped framebuffer, maps `Waveform` to DU / GL16 / GC16, refreshes via `fbink_refresh`. Linux only.
-- `crates/koboterm` — the binary: `probe` (device facts) and `demo` (scripted session on the panel).
+- `crates/transport` — `Transport` trait; `PtyTransport` (forkpty, host-tested) and `SshTransport` (russh in-process, pubkey auth, pty + shell/exec, resize; tokio runtime on a background thread so the main loop stays synchronous). `keygen` writes an OpenSSH ed25519 key pair. Host keys are not verified yet.
+- `crates/koboterm` — the binary: `probe`, `demo`, `keygen`, `run -- CMD` and `ssh user@host[:port] [--key PATH] [--cmd COMMAND]`. `--type TEXT` injects keystrokes 1 s apart, `--hold SECS` keeps the last screen after exit. The session loop in `main.rs` (`session::run`) is the shape of the real app: read transport, feed terminal, tick renderer every 10 ms.
 
 Rebuilding the bindings after an FBInk bump: preprocess with `zig cc -target arm-linux-musleabihf -DFBINK_FOR_KOBO -DFBINK_MINIMAL -DFBINK_WITH_DRAW -E -P third_party/FBInk/fbink.h`, run `bindgen` on the result with `-- -target arm-linux-musleabihf` (needs `LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib`), allowlist `fbink_.*` functions and `FBInk.*`/`*_INDEX_[TE]` types, `--no-layout-tests --use-core`.
 

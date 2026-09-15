@@ -13,6 +13,7 @@ panel.workspace = true
 term.workspace = true
 render.workspace = true
 font.workspace = true
+transport.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 

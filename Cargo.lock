@@ -58,6 +58,7 @@ dependencies = [
  "panel-fbink",
  "render",
  "term",
+ "transport",
 ]
 
 [[package]]
@@ -124,6 +125,14 @@ version = "0.0.1"
 dependencies = [
  "panel",
  "vt100",
+]
+
+[[package]]
+name = "transport"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "libc",
 ]
 
 [[package]]

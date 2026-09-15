@@ -10,10 +10,90 @@ fn main() -> Result<()> {
         "probe" => probe(),
         #[cfg(target_os = "linux")]
         "demo" => demo::run(),
+        #[cfg(target_os = "linux")]
+        "run" => session::run(std::env::args().skip(2).collect()),
         _ => {
-            eprintln!("usage: koboterm probe | demo");
+            eprintln!("usage: koboterm probe | demo | run [--type TEXT]... [--hold SECS] -- CMD [ARGS...]");
             std::process::exit(2);
         }
+    }
+}
+
+/// Run a command under a pty and show it on the panel until it exits.
+/// `--type TEXT` queues keystrokes (with `\n` escapes) sent 1 s after start,
+/// which stands in for a keyboard until we have one.
+#[cfg(target_os = "linux")]
+mod session {
+    use anyhow::{bail, Result};
+    use panel::Panel;
+    use render::{Config, Renderer};
+    use std::time::{Duration, Instant};
+    use term::Terminal;
+    use transport::{PtyTransport, Transport};
+
+    pub fn run(args: Vec<String>) -> Result<()> {
+        let mut typed: Vec<String> = Vec::new();
+        let mut hold = 2u64;
+        let mut cmd: Vec<String> = Vec::new();
+        let mut it = args.into_iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--type" => typed.push(it.next().unwrap_or_default().replace("\\n", "\n").replace("\\t", "\t")),
+                "--hold" => hold = it.next().unwrap_or_default().parse().unwrap_or(2),
+                "--" => {
+                    cmd.extend(it.by_ref());
+                    break;
+                }
+                other => cmd.push(other.to_string()),
+            }
+        }
+        if cmd.is_empty() {
+            cmd.push("/bin/sh".into());
+        }
+        let font = font::Font::from_bdf(font::SPLEEN_16X32);
+        let mut panel = panel_fbink::FbinkPanel::open(font)?;
+        let g = panel.geometry();
+        panel.clear()?;
+        let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+        let mut tr = PtyTransport::spawn(&argv, g.cols, g.rows)?;
+        let mut term = Terminal::new(g.cols, g.rows, 0);
+        let mut r = Renderer::new(Config::default(), g.cols, g.rows);
+        let t0 = Instant::now();
+        let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
+        let mut buf = [0u8; 8192];
+        let mut next_type_at = 1000u64;
+        let mut typed = typed.into_iter();
+        let mut exited_at: Option<u64> = None;
+        loop {
+            let n = tr.read(&mut buf, Duration::from_millis(10))?;
+            if n > 0 {
+                term.feed(&buf[..n]);
+            }
+            if exited_at.is_none() && ms(t0) >= next_type_at {
+                if let Some(s) = typed.next() {
+                    tr.write_all(s.as_bytes())?;
+                    next_type_at = ms(t0) + 1500;
+                }
+            }
+            let grid = term.snapshot();
+            r.tick(ms(t0), &grid, &mut panel);
+            if exited_at.is_none() {
+                if let Some(st) = tr.exit_status() {
+                    eprintln!("child exited with {st}");
+                    exited_at = Some(ms(t0));
+                }
+            }
+            if let Some(t) = exited_at {
+                if ms(t0) - t > hold * 1000 {
+                    break;
+                }
+            }
+        }
+        eprintln!("refreshes [fast, partial, full]: {:?}", panel.refreshes);
+        if panel.refreshes[0] == 0 && panel.refreshes[2] == 0 {
+            bail!("nothing was ever drawn");
+        }
+        Ok(())
     }
 }
 
@@ -38,7 +118,7 @@ mod demo {
         let t0 = Instant::now();
         let now = |t0: Instant| t0.elapsed().as_millis() as u64;
 
-        let mut step = |term: &mut Terminal, r: &mut Renderer, panel: &mut panel_fbink::FbinkPanel, bytes: &[u8], wait_ms: u64| {
+        let step = |term: &mut Terminal, r: &mut Renderer, panel: &mut panel_fbink::FbinkPanel, bytes: &[u8], wait_ms: u64| {
             term.feed(bytes);
             let end = now(t0) + wait_ms;
             loop {

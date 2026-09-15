@@ -1,20 +1,13 @@
 [package]
-name = "koboterm"
+name = "panel-fbink"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
-
-[[bin]]
-name = "koboterm"
-path = "src/main.rs"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 panel.workspace = true
-term.workspace = true
-render.workspace = true
 font.workspace = true
 anyhow.workspace = true
-libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-panel-fbink.workspace = true
+fbink-sys.workspace = true

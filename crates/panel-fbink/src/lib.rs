@@ -1,0 +1,197 @@
+//! The real e-ink panel, driven through FBInk. FBInk owns device detection,
+//! the framebuffer mapping and the refresh ioctls; this crate owns the cell
+//! grid, glyph blitting and the mapping from `Waveform` to a waveform mode.
+//! Only compiled for Linux targets; the workspace still builds and tests on a
+//! laptop.
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use anyhow::{bail, Result};
+    use fbink_sys as fb;
+    use font::Font;
+    use panel::{Cell, CellRect, Geometry, Panel, Waveform};
+
+    pub struct FbinkPanel {
+        fd: core::ffi::c_int,
+        cfg: fb::FBInkConfig,
+        buf: *mut u8,
+        buf_len: usize,
+        stride: usize,
+        bpp: u32,
+        inverted_gray: bool,
+        font: Font,
+        geo: Geometry,
+        x0: u32,
+        y0: u32,
+        pub device_name: String,
+        pub view: (u32, u32),
+        pub refreshes: [u32; 3],
+    }
+
+    fn cstr(a: &[core::ffi::c_char]) -> String {
+        unsafe { core::ffi::CStr::from_ptr(a.as_ptr()) }.to_string_lossy().into_owned()
+    }
+
+    impl FbinkPanel {
+        pub fn open(font: Font) -> Result<Self> {
+            unsafe {
+                let fd = fb::fbink_open();
+                if fd < 0 {
+                    bail!("fbink_open failed: {}", std::io::Error::last_os_error());
+                }
+                let mut cfg: fb::FBInkConfig = core::mem::zeroed();
+                cfg.is_quiet = true;
+                if fb::fbink_init(fd, &cfg) < 0 {
+                    bail!("fbink_init failed");
+                }
+                let mut st: fb::FBInkState = core::mem::zeroed();
+                fb::fbink_get_state(&cfg, &mut st);
+                let mut buf_len = 0usize;
+                let buf = fb::fbink_get_fb_pointer(fd, &mut buf_len);
+                if buf.is_null() {
+                    bail!("fbink_get_fb_pointer returned null");
+                }
+                let cols = (st.view_width / font.width as u32) as u16;
+                let rows = (st.view_height / font.height as u32) as u16;
+                let x0 = st.view_hori_origin as u32 + (st.view_width - cols as u32 * font.width as u32) / 2;
+                let y0 = st.view_vert_origin as u32 + (st.view_height - rows as u32 * font.height as u32) / 2;
+                Ok(FbinkPanel {
+                    fd,
+                    cfg,
+                    buf,
+                    buf_len,
+                    stride: st.scanline_stride as usize,
+                    bpp: st.bpp,
+                    inverted_gray: st.inverted_grayscale,
+                    font,
+                    geo: Geometry { cols, rows },
+                    x0,
+                    y0,
+                    device_name: cstr(&st.device_name),
+                    view: (st.view_width, st.view_height),
+                    refreshes: [0; 3],
+                })
+            }
+        }
+
+        /// White the whole screen with a flashing full refresh.
+        pub fn clear(&mut self) -> Result<()> {
+            let mut cfg = self.cfg;
+            cfg.wfm_mode = fb::WFM_MODE_INDEX_E_WFM_GC16;
+            cfg.is_flashing = true;
+            let rv = unsafe { fb::fbink_cls(self.fd, &cfg, core::ptr::null(), false) };
+            if rv < 0 {
+                bail!("fbink_cls failed");
+            }
+            self.refreshes[2] += 1;
+            Ok(())
+        }
+
+        pub fn font(&self) -> &Font {
+            &self.font
+        }
+
+        #[inline]
+        fn put(&mut self, x: u32, y: u32, gray: u8) {
+            let off = y as usize * self.stride;
+            unsafe {
+                match self.bpp {
+                    32 => {
+                        let p = self.buf.add(off + x as usize * 4);
+                        if off + x as usize * 4 + 4 > self.buf_len {
+                            return;
+                        }
+                        *p = gray;
+                        *p.add(1) = gray;
+                        *p.add(2) = gray;
+                        *p.add(3) = 0xFF;
+                    }
+                    8 => {
+                        let p = self.buf.add(off + x as usize);
+                        *p = if self.inverted_gray { 0xFF - gray } else { gray };
+                    }
+                    16 => {
+                        let g = gray as u16;
+                        let v: u16 = ((g >> 3) << 11) | ((g >> 2) << 5) | (g >> 3);
+                        let p = self.buf.add(off + x as usize * 2) as *mut u16;
+                        p.write_unaligned(v);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn px_rect(&self, r: CellRect) -> (u32, u32, u32, u32) {
+            let (fw, fh) = (self.font.width as u32, self.font.height as u32);
+            (self.y0 + r.row as u32 * fh, self.x0 + r.col as u32 * fw, r.cols as u32 * fw, r.rows as u32 * fh)
+        }
+    }
+
+    impl Panel for FbinkPanel {
+        fn geometry(&self) -> Geometry {
+            self.geo
+        }
+
+        fn draw(&mut self, col: u16, row: u16, cell: &Cell) {
+            let (fw, fh) = (self.font.width as u32, self.font.height as u32);
+            let (mut fg, mut bg) = (0x00u8, 0xFFu8);
+            if cell.dim {
+                fg = 0x60;
+            }
+            if cell.inverse {
+                core::mem::swap(&mut fg, &mut bg);
+            }
+            let rows: Vec<u32> = if cell.ch == '\0' {
+                vec![0; fh as usize]
+            } else {
+                let g = &self.font.glyph(cell.ch).rows;
+                if cell.bold { g.iter().map(|r| r | (r >> 1)).collect() } else { g.clone() }
+            };
+            let px = self.x0 + col as u32 * fw;
+            let py = self.y0 + row as u32 * fh;
+            for (dy, bits) in rows.iter().enumerate() {
+                let underline = cell.underline && dy as u32 >= fh - 2;
+                for dx in 0..fw {
+                    let on = underline || bits & (1u32 << (31 - dx)) != 0;
+                    self.put(px + dx, py + dy as u32, if on { fg } else { bg });
+                }
+            }
+        }
+
+        fn refresh(&mut self, rect: CellRect, wf: Waveform) {
+            let (top, left, w, h) = self.px_rect(rect);
+            let mut cfg = self.cfg;
+            cfg.wfm_mode = match wf {
+                Waveform::Fast => fb::WFM_MODE_INDEX_E_WFM_DU,
+                Waveform::Partial => fb::WFM_MODE_INDEX_E_WFM_GL16,
+                Waveform::Full => fb::WFM_MODE_INDEX_E_WFM_GC16,
+            };
+            cfg.is_flashing = wf == Waveform::Full;
+            unsafe {
+                if wf == Waveform::Full {
+                    fb::fbink_wait_for_complete(self.fd, fb::fbink_get_last_marker());
+                }
+                let rv = fb::fbink_refresh(self.fd, top, left, w, h, &cfg);
+                if rv < 0 {
+                    eprintln!("fbink_refresh({top},{left},{w},{h}) failed: {rv}");
+                }
+            }
+            self.refreshes[match wf {
+                Waveform::Fast => 0,
+                Waveform::Partial => 1,
+                Waveform::Full => 2,
+            }] += 1;
+        }
+    }
+
+    impl Drop for FbinkPanel {
+        fn drop(&mut self) {
+            unsafe {
+                fb::fbink_close(self.fd);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use imp::FbinkPanel;

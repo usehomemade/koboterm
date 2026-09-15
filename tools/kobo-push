@@ -1,17 +1,36 @@
 #!/bin/sh
 # Copy a local file to the Kobo and verify its checksum.
 #
-# Goes through the ssh tty as a base64 heredoc because the device has no scp or
-# sftp-server. ~330 KB takes about a minute. For anything larger, use USB.
+# The device has no scp or sftp-server, so this goes through the ssh tty as
+# base64 heredocs. The file is sent in 256 KB chunks, each verified by md5 and
+# retried, because the Kobo drops Wi-Fi whenever it falls asleep. Roughly 1 MB
+# per 3 minutes. For big files, use USB.
 #
 # usage: tools/kobo-push <local-file> <remote-path>
 set -eu
 SRC="$1"; DST="$2"
-LOCAL_MD5="$(md5 -q "$SRC" 2>/dev/null || md5sum "$SRC" | cut -d' ' -f1)"
-{
-  echo "cat > '$DST.b64' <<'EOF_B64'"
-  base64 -b 76 -i "$SRC" 2>/dev/null || base64 -w 76 "$SRC"
-  echo "EOF_B64"
-  echo "base64 -d '$DST.b64' > '$DST' && rm -f '$DST.b64' && chmod +x '$DST'"
-  echo "md5sum '$DST'"
-} | "$(dirname "$0")/kobo-sh" | tee /dev/stderr | grep -q "^$LOCAL_MD5 " && echo "pushed $SRC -> $DST (md5 ok)" || { echo "push FAILED: checksum mismatch" >&2; exit 1; }
+HERE="$(cd "$(dirname "$0")" && pwd)"
+md5_of() { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+split -b 262144 -a 3 "$SRC" "$WORK/part."
+echo "rm -f '$DST.parts.*'" | "$HERE/kobo-sh" >/dev/null
+n=0
+for part in "$WORK"/part.*; do
+  n=$((n+1)); want="$(md5_of "$part")"; name="$(basename "$part")"
+  ok=0
+  for try in 1 2 3 4; do
+    got="$( {
+      echo "cat > '$DST.parts.$name.b64' <<'EOF_B64'"
+      base64 -b 76 -i "$part" 2>/dev/null || base64 -w 76 "$part"
+      echo "EOF_B64"
+      echo "base64 -d '$DST.parts.$name.b64' > '$DST.parts.$name' && rm -f '$DST.parts.$name.b64' && md5sum '$DST.parts.$name'"
+    } | "$HERE/kobo-sh" | grep -oE '^[0-9a-f]{32}' || true )"
+    if [ "$got" = "$want" ]; then ok=1; echo "chunk $n ok"; break; fi
+    echo "chunk $n try $try failed (device asleep?), retrying in 5s" >&2; sleep 5
+  done
+  [ "$ok" = 1 ] || { echo "push FAILED at chunk $n" >&2; exit 1; }
+done
+want="$(md5_of "$SRC")"
+got="$( printf "cat '%s'.parts.part.* > '%s' && rm -f '%s'.parts.* && chmod +x '%s' && md5sum '%s'\n" "$DST" "$DST" "$DST" "$DST" "$DST" | "$HERE/kobo-sh" | grep -oE '^[0-9a-f]{32}' || true )"
+[ "$got" = "$want" ] && echo "pushed $SRC -> $DST (md5 ok)" || { echo "push FAILED: final checksum mismatch" >&2; exit 1; }

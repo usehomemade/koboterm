@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 koboterm — an SSH terminal client for Kobo e-readers. Sit with a Kobo, connect to a remote machine, and work in a terminal (the primary use case is running Claude Code over SSH). `CLAUDE.md` is a symlink to this file; edit `AGENTS.md`.
 
-**Status: bootstrapping.** Rust workspace; host-side tests exist for the terminal model and the refresh scheduler. Nothing draws on a device yet.
+**Status: first pixels.** Rust workspace; host-side tests for the terminal model, refresh scheduler and font. `koboterm demo` renders a scripted terminal session on the device through FBInk (67x45 cells at Spleen 16x32 on the Clara BW). No pty, no network, no input yet. License is GPL-3.0-or-later because FBInk is linked in.
 
 ## Commands
 
@@ -14,9 +14,10 @@ Toolchain: Rust stable via `rustup` (Homebrew), `zig` + `cargo-zigbuild` for cro
 cargo test                                   # host-side tests (terminal model, renderer, scheduler)
 cargo test -p render streaming               # one test by name, in one crate
 cargo run -p koboterm -- probe               # host: prints uname; on device also fb + input info
-cargo zigbuild --release --target armv7-unknown-linux-musleabihf   # device binary (static, ~330 KB)
+cargo zigbuild --release --target armv7-unknown-linux-musleabihf   # device binary (static, ~750 KB; builds FBInk via make)
 tools/kobo-push target/armv7-unknown-linux-musleabihf/release/koboterm /tmp/koboterm   # deploy (about 1 min)
 echo "/tmp/koboterm probe" | tools/kobo-sh                                              # run on device
+echo "/tmp/koboterm demo" | tools/kobo-sh                                               # scripted session on the e-ink screen
 ```
 
 `cargo` lives in `/opt/homebrew/opt/rustup/bin`; add that to PATH.
@@ -38,7 +39,12 @@ Verified 2026-09-15 by running `koboterm probe` on the device:
 - `crates/panel` — `Panel` trait (cell-addressed draw + refresh with a `Waveform`), `FakePanel` that logs refreshes for tests.
 - `crates/term` — terminal model over `vt100`; `Terminal::snapshot()` returns a `Grid` of reduced cells.
 - `crates/render` — the refresh scheduler. Diffs wanted grid vs shadow grid on every tick; debounce with a latency cap; row-band coalescing; ghost budget. Tests here are the "refreshes per second" metric.
-- `crates/koboterm` — the binary. Only `probe` so far.
+- `crates/font` — BDF parser; ships Spleen 16x32 and 12x24 (BSD-2-Clause). Glyphs the font lacks render as a hollow box.
+- `crates/fbink-sys` — raw FFI to FBInk. `build.rs` copies `third_party/FBInk` (git submodule, pinned) into `OUT_DIR` and runs its Makefile (`staticlib KOBO=true MINIMAL=true DRAW=1`) with the compiler cargo resolved. Bindings are pre-generated with bindgen for the ARM target and committed. Empty crate on non-Linux hosts.
+- `crates/panel-fbink` — `FbinkPanel: Panel`. Writes glyphs straight into FBInk's mapped framebuffer, maps `Waveform` to DU / GL16 / GC16, refreshes via `fbink_refresh`. Linux only.
+- `crates/koboterm` — the binary: `probe` (device facts) and `demo` (scripted session on the panel).
+
+Rebuilding the bindings after an FBInk bump: preprocess with `zig cc -target arm-linux-musleabihf -DFBINK_FOR_KOBO -DFBINK_MINIMAL -DFBINK_WITH_DRAW -E -P third_party/FBInk/fbink.h`, run `bindgen` on the result with `-- -target arm-linux-musleabihf` (needs `LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib`), allowlist `fbink_.*` functions and `FBInk.*`/`*_INDEX_[TE]` types, `--no-layout-tests --use-core`.
 
 ## The idea
 

@@ -15,6 +15,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "cc"
+version = "1.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3eb0f42d6c360dc3f8a821f6bf2fdea7f72bfd36b3076eb0e6d1e9e0752fff4"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
+name = "fbink-sys"
+version = "0.0.1"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+
+[[package]]
+name = "font"
+version = "0.0.1"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -25,8 +52,10 @@ name = "koboterm"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "font",
  "libc",
  "panel",
+ "panel-fbink",
  "render",
  "term",
 ]
@@ -46,6 +75,16 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "panel"
 version = "0.0.1"
+
+[[package]]
+name = "panel-fbink"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "fbink-sys",
+ "font",
+ "panel",
+]
 
 [[package]]
 name = "proc-macro2"
@@ -72,6 +111,12 @@ dependencies = [
  "panel",
  "term",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "term"

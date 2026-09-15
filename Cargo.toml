@@ -1,16 +1,20 @@
 [workspace]
 resolver = "2"
-members = ["crates/panel", "crates/term", "crates/render", "crates/koboterm"]
+members = ["crates/panel", "crates/term", "crates/render", "crates/font", "crates/fbink-sys", "crates/panel-fbink", "crates/koboterm"]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 panel = { path = "crates/panel" }
 term = { path = "crates/term" }
 render = { path = "crates/render" }
+font = { path = "crates/font" }
+fbink-sys = { path = "crates/fbink-sys" }
+panel-fbink = { path = "crates/panel-fbink" }
+cc = "1"
 vt100 = "0.15"
 libc = "0.2"
 anyhow = "1"

@@ -12,10 +12,15 @@ KEY="${KOBO_KEY:-$HOME/.ssh/id_ed25519_personal}"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 {
-  echo "stty -echo"
+  echo "stty -echo; PS1=''; PS2=''"
   echo "echo ===KOBO-BE\"\"GIN"
   cat
   echo "echo ===KOBO-E\"\"ND"
   echo "exit"
-} | ssh -tt -i "$KEY" -o ConnectTimeout=8 -o BatchMode=yes "root@$HOST" > "$TMP" 2>&1 || true
-tr -d '\r' < "$TMP" | sed -n '/===KOBO-BEGIN/,/===KOBO-END/p' | sed -e '1d' -e '$d' -e 's/^\[@kobo \]# //'
+} | ssh -tt -i "$KEY" -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o BatchMode=yes "root@$HOST" > "$TMP" 2>&1 || true
+[ -n "${KOBO_RAW:-}" ] && cp "$TMP" "$KOBO_RAW"
+if ! grep -q '===KOBO-END' "$TMP"; then
+  echo "kobo-sh: session did not complete (device offline?): $(grep -m1 -E 'ssh:|Connection' "$TMP")" >&2
+  exit 1
+fi
+LC_ALL=C tr -d '\r' < "$TMP" | LC_ALL=C sed -n '/===KOBO-BEGIN/,/===KOBO-END/p' | sed -e '1d' -e '$d' -E -e 's/^(> )*(\[@kobo \]# )?//'

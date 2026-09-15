@@ -8,10 +8,74 @@ fn main() -> Result<()> {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
         "probe" => probe(),
+        #[cfg(target_os = "linux")]
+        "demo" => demo::run(),
         _ => {
-            eprintln!("usage: koboterm probe");
+            eprintln!("usage: koboterm probe | demo");
             std::process::exit(2);
         }
+    }
+}
+
+/// Scripted terminal session on the real panel: proves glyphs, attributes,
+/// scrolling and the refresh scheduler end to end, and prints refresh counts.
+#[cfg(target_os = "linux")]
+mod demo {
+    use anyhow::Result;
+    use panel::Panel;
+    use render::{Config, Renderer};
+    use std::time::{Duration, Instant};
+    use term::Terminal;
+
+    pub fn run() -> Result<()> {
+        let font = font::Font::from_bdf(font::SPLEEN_16X32);
+        let mut panel = panel_fbink::FbinkPanel::open(font)?;
+        let g = panel.geometry();
+        eprintln!("panel: {} {}x{} px, {}x{} cells", panel.device_name, panel.view.0, panel.view.1, g.cols, g.rows);
+        panel.clear()?;
+        let mut term = Terminal::new(g.cols, g.rows, 0);
+        let mut r = Renderer::new(Config::default(), g.cols, g.rows);
+        let t0 = Instant::now();
+        let now = |t0: Instant| t0.elapsed().as_millis() as u64;
+
+        let mut step = |term: &mut Terminal, r: &mut Renderer, panel: &mut panel_fbink::FbinkPanel, bytes: &[u8], wait_ms: u64| {
+            term.feed(bytes);
+            let end = now(t0) + wait_ms;
+            loop {
+                let grid = term.snapshot();
+                r.tick(now(t0), &grid, panel);
+                if now(t0) >= end {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let w = g.cols as usize;
+        let top = format!("\u{250c}{}\u{2510}\r\n", "\u{2500}".repeat(w - 2));
+        let bot = format!("\u{2514}{}\u{2518}\r\n", "\u{2500}".repeat(w - 2));
+        let line = |s: &str| format!("\u{2502} {:<width$}\u{2502}\r\n", s, width = w - 4);
+        step(&mut term, &mut r, &mut panel, top.as_bytes(), 0);
+        step(&mut term, &mut r, &mut panel, line("koboterm demo").as_bytes(), 0);
+        step(&mut term, &mut r, &mut panel, line(&format!("{}x{} cells, Spleen 16x32", g.cols, g.rows)).as_bytes(), 0);
+        step(&mut term, &mut r, &mut panel, line("\x1b[1mbold\x1b[0m \x1b[7minverse\x1b[0m \x1b[4munderline\x1b[0m \x1b[2mdim\x1b[0m").as_bytes(), 0);
+        step(&mut term, &mut r, &mut panel, bot.as_bytes(), 800);
+
+        // Streaming: 120 lines at 40 ms each. The scheduler should cap this at ~4 refreshes/s.
+        for i in 0..120 {
+            step(&mut term, &mut r, &mut panel, format!("{i:4}  the quick brown fox jumps over the lazy dog 0123456789\r\n").as_bytes(), 40);
+        }
+        let after_stream = panel.refreshes;
+        // Spinner for 2 s.
+        step(&mut term, &mut r, &mut panel, b"working ", 0);
+        for _ in 0..50 {
+            for f in [b"\x08|", b"\x08/", b"\x08-", b"\x08\\"] {
+                step(&mut term, &mut r, &mut panel, f, 10);
+            }
+        }
+        step(&mut term, &mut r, &mut panel, b"\x08done.\r\n$ ", 6000);
+        eprintln!("refreshes [fast, partial, full]: after stream {:?}, total {:?}", after_stream, panel.refreshes);
+        Ok(())
     }
 }
 

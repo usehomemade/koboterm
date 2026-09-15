@@ -66,7 +66,7 @@ impl TopBar {
         // Back arrow + title.
         icons::back_arrow(c, self.margin, cy, 34 * self.w / 1072, 3, BLACK);
         let size = 30.0 * self.w as f32 / 1072.0;
-        c.text(&f.sans_bold, size, self.margin + 58 * self.w / 1072, cy + f.sans_bold.ascent(size) / 2 - 2, &st.title, BLACK);
+        c.text(&f.sans_bold, size, self.margin + 64 * self.w / 1072, cy + f.sans_bold.ascent(size) / 2, &st.title, BLACK);
         // Icons, right to left.
         for (a, r) in &self.buttons {
             let (cx, cy) = (r.x + r.w / 2, cy);
@@ -87,9 +87,10 @@ impl TopBar {
         let r = self.status_rect();
         c.fill(r, 0xFF);
         let size = 26.0 * self.w as f32 / 1072.0;
-        c.text(&f.sans, size, self.margin, r.h / 2 + f.sans.ascent(size) / 2, &st.clock, BLACK);
+        let cy = r.h * 55 / 100;
+        c.text(&f.sans, size, self.margin, cy + f.sans.ascent(size) / 2, &st.clock, BLACK);
         let (bw, bh) = (40 * self.w / 1072, 22 * self.w / 1072);
-        icons::battery(c, self.w - self.margin - bw - 4, r.h / 2 - bh / 2, bw, bh, st.battery_pct, st.charging, BLACK);
+        icons::battery(c, self.w - self.margin - bw - 4, cy - bh / 2, bw, bh, st.battery_pct, st.charging, BLACK);
     }
 
     /// Redraw only the status line (clock / battery ticks).

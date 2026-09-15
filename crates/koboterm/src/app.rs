@@ -21,6 +21,18 @@ use ui::{draw, next_session_name, AddForm, FormAction, Home, HomeAction, HostEnt
 use crate::pair::PairServer;
 
 const TOUCH_DEV: &str = "/dev/input/event1";
+
+/// Set by SIGTERM/SIGINT: every loop returns so Nickel is thawed and the
+/// screen handed back instead of dying mid-session.
+static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_term(_sig: libc::c_int) {
+    QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn quitting() -> bool {
+    QUIT.load(std::sync::atomic::Ordering::SeqCst)
+}
 const SWIPE_MIN_PX: i32 = 60;
 const UI_FONT: usize = 0;
 const TERM_FONT: usize = 1;
@@ -87,6 +99,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
         if a == "--nickel" {
             nickel_mode = crate::nickel::Mode::parse(&it.next().unwrap_or_default());
         }
+    }
+    unsafe {
+        libc::signal(libc::SIGTERM, on_term as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as libc::sighandler_t);
     }
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
@@ -213,7 +229,7 @@ fn wait_tap(panel: &FbinkPanel, touch: &mut TouchDevice, timeout: Duration) -> O
 
 fn wait_event(panel: &FbinkPanel, touch: &mut TouchDevice, pair: Option<&PairServer>, fetcher: Option<&SessionFetcher>, timeout: Duration) -> Wait {
     let start = Instant::now();
-    while start.elapsed() < timeout {
+    while start.elapsed() < timeout && !quitting() {
         if let Some(e) = pair.and_then(|p| p.try_recv()) {
             return Wait::Registered(e);
         }
@@ -236,7 +252,20 @@ fn main_loop(panel: &mut FbinkPanel, touch: &mut TouchDevice, hosts: &mut Vec<Ho
     let pair_url = ctx.pair.as_ref().map(|p| p.url.clone()).unwrap_or_else(|| "http://<kobo-ip>:8080".into());
     let fetcher = SessionFetcher::new();
     let mut sessions: Vec<Sessions> = vec![Sessions::Unknown; hosts.len()];
+    // Development aid: KOBOTERM_CONNECT=<machine name> connects at once,
+    // KOBOTERM_OSK=0 starts with the keyboard hidden (top bar visible).
+    if let Ok(name) = std::env::var("KOBOTERM_CONNECT") {
+        if let Some(entry) = hosts.iter().find(|h| h.name == name).cloned() {
+            match session(panel, touch, &entry, settings, ctx) {
+                Ok(()) => status = format!("{}: session ended", entry.name),
+                Err(e) => status = format!("{}: {e:#}", entry.name),
+            }
+        }
+    }
     loop {
+        if quitting() {
+            return Ok(());
+        }
         sessions.resize(hosts.len(), Sessions::Unknown);
         for (i, h) in hosts.iter().enumerate() {
             if sessions[i] == Sessions::Unknown && h.tmux_bin().is_some() {
@@ -280,6 +309,7 @@ fn main_loop(panel: &mut FbinkPanel, touch: &mut TouchDevice, hosts: &mut Vec<Ho
         };
         match home.hit(col, row) {
             HomeAction::Quit => return Ok(()),
+            _ if quitting() => return Ok(()),
             HomeAction::Text => {
                 text_popup(panel, touch, settings, ctx, 120, None)?;
             }
@@ -379,6 +409,9 @@ fn run_popup(panel: &mut FbinkPanel, touch: &mut TouchDevice, fonts: &Fonts, pop
     let mut dragging: Option<usize> = None;
     let mut dragged = false;
     loop {
+        if quitting() {
+            return Ok(());
+        }
         for ev in touch.poll(Duration::from_millis(50)) {
             match ev {
                 TouchEvent::Down { x, y } => {
@@ -589,7 +622,8 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
     panel.refresh(CellRect { col: 0, row: 0, cols: ui.cols, rows: 3 }, Waveform::Fast);
 
     let bar = TopBar::new(panel.view.0 as i32);
-    let lay = layout(panel, margin, bar.height(), true);
+    let start_with_osk = std::env::var("KOBOTERM_OSK").map(|v| v != "0").unwrap_or(true);
+    let lay = layout(panel, margin, bar.height(), start_with_osk);
     let osk = Osk::top(ui.cols, ui.rows);
     let tg = lay.term.geometry();
     let target = SshTarget::parse(&entry.spec, &ctx.key_path, command)?;
@@ -617,6 +651,17 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
                 attempt = 0;
                 first = false;
                 st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, ctx.fonts.as_ref(), &mut st.term, &mut tr, ms(st.t0))?;
+                // Development aid: KOBOTERM_POPUP=brightness|text opens a popup on connect.
+                if let Ok(which) = std::env::var("KOBOTERM_POPUP") {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let notch = bar_notch(&st.bar, if which == "text" { BarAction::Text } else { BarAction::Brightness });
+                    if which == "text" {
+                        text_popup(panel, touch, settings, ctx, st.bar.height() + 8, notch)?;
+                    } else {
+                        brightness_popup(panel, touch, ctx, st.bar.height() + 8, notch)?;
+                    }
+                    st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, ctx.fonts.as_ref(), &mut st.term, &mut tr, ms(st.t0))?;
+                }
                 let started = ms(st.t0);
                 match run_session(panel, touch, &mut st, &mut tr, settings, ctx)? {
                     End::Home => return Ok(None),
@@ -643,7 +688,7 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
         let delay = 2u64.pow(attempt.min(4)).min(30);
         banner(panel, &st, &format!("[connection lost; reconnecting in {delay}s, tap Home to stop]"));
         let until = Instant::now() + Duration::from_secs(delay);
-        while Instant::now() < until {
+        while Instant::now() < until && !quitting() {
             for ev in touch.poll(Duration::from_millis(50)) {
                 if let TouchEvent::Tap { x, y } = ev {
                     if !st.lay.osk_visible && y < st.bar.height() && matches!(st.bar.hit(x, y), BarAction::Back | BarAction::More) {
@@ -666,6 +711,9 @@ fn run_session(panel: &mut FbinkPanel, touch: &mut TouchDevice, st: &mut Session
     let t0 = st.t0;
     let mut buf = [0u8; 8192];
     loop {
+        if quitting() {
+            return Ok(End::Home);
+        }
         let n = tr.read(&mut buf, Duration::from_millis(10))?;
         if n > 0 {
             st.term.feed(&buf[..n]);

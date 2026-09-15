@@ -18,6 +18,8 @@ cargo zigbuild --release --target armv7-unknown-linux-musleabihf   # device bina
 tools/kobo-push target/armv7-unknown-linux-musleabihf/release/koboterm /tmp/koboterm   # deploy (about 1 min)
 echo "/tmp/koboterm probe" | tools/kobo-sh                                              # run on device
 echo "/tmp/koboterm demo" | tools/kobo-sh                                               # scripted session on the e-ink screen
+tools/kobo-shot shot.png                                                                 # screenshot of the device (half size PNG)
+# Visual checks without tapping: KOBOTERM_CONNECT=<machine> KOBOTERM_OSK=0 KOBOTERM_POPUP=brightness|text ./koboterm app --nickel leave
 echo "/tmp/koboterm keygen" | tools/kobo-sh                                             # device key -> /mnt/onboard/.adds/koboterm/id_ed25519
 printf '/tmp/koboterm ssh tunc@192.168.0.199 --type "uname -a\\n" --type "exit\\n"\n' | tools/kobo-sh   # remote session (Mac with Remote Login on)
 ```
@@ -45,6 +47,10 @@ Verified 2026-09-15 by running `koboterm probe` on the device:
 - `crates/fbink-sys` — raw FFI to FBInk. `build.rs` copies `third_party/FBInk` (git submodule, pinned) into `OUT_DIR` and runs its Makefile (`staticlib KOBO=true MINIMAL=true DRAW=1`) with the compiler cargo resolved. Bindings are pre-generated with bindgen for the ARM target and committed. Empty crate on non-Linux hosts.
 - `crates/panel-fbink` — `FbinkPanel: Panel`. Writes glyphs straight into FBInk's mapped framebuffer, maps `Waveform` to DU / GL16 / GC16, refreshes via `fbink_refresh`. Linux only.
 - `crates/transport` — `Transport` trait; `PtyTransport` (forkpty, host-tested) and `SshTransport` (russh in-process, pubkey auth, pty + shell/exec, resize; tokio runtime on a background thread so the main loop stays synchronous). `keygen` writes an OpenSSH ed25519 key pair. Host keys are not verified yet.
+- `crates/px` — pixel canvas trait (fills, lines, antialiased circles, TrueType text via fontdue) + `FakeCanvas`; `FbinkPanel` implements it.
+- `crates/pxui` — the reader-style chrome: `TopBar` (clock, battery, back arrow, sun / Aa / keyboard / gear / dots icons) and `Popup` (serif titles, double-ring draggable sliders, segmented choices). Fonts are Nickel's own Rakuten Sans UI / Rakuten Serif, loaded at runtime from `/usr/local/Trolltech/QtEmbedded-4.6.2-arm/lib/fonts`.
+- `crates/input` — evdev touch parser (tested against recorded taps) and the grabbing `TouchDevice`.
+- `crates/ui` — cell-grid widgets: on-screen keyboard, home screen (machines + tmux sessions), add-machine form.
 - `crates/koboterm` — the binary: `probe`, `demo`, `keygen`, `run -- CMD` and `ssh user@host[:port] [--key PATH] [--cmd COMMAND]`. `--type TEXT` injects keystrokes 1 s apart, `--hold SECS` keeps the last screen after exit. The session loop in `main.rs` (`session::run`) is the shape of the real app: read transport, feed terminal, tick renderer every 10 ms.
 
 Rebuilding the bindings after an FBInk bump: preprocess with `zig cc -target arm-linux-musleabihf -DFBINK_FOR_KOBO -DFBINK_MINIMAL -DFBINK_WITH_DRAW -E -P third_party/FBInk/fbink.h`, run `bindgen` on the result with `-- -target arm-linux-musleabihf` (needs `LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib`), allowlist `fbink_.*` functions and `FBInk.*`/`*_INDEX_[TE]` types, `--no-layout-tests --use-core`.

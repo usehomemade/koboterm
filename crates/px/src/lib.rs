@@ -198,9 +198,10 @@ impl Face {
         w.round() as i32
     }
 
-    /// Distance from baseline to the top of capitals, roughly, for vertical centring.
+    /// Cap height (measured on 'H'), the right thing to centre text on.
     pub fn ascent(&self, size: f32) -> i32 {
-        self.font.horizontal_line_metrics(size).map(|m| m.ascent.round() as i32).unwrap_or((size * 0.75) as i32)
+        let h = self.font.metrics('H', size).height as i32;
+        if h > 0 { h } else { (size * 0.7) as i32 }
     }
 
     pub fn descent(&self, size: f32) -> i32 {

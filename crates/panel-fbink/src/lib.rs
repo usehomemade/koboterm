@@ -26,6 +26,9 @@ mod imp {
         pub device_name: String,
         pub view: (u32, u32),
         pub refreshes: [u32; 3],
+        pub touch_swap_axes: bool,
+        pub touch_mirror_x: bool,
+        pub touch_mirror_y: bool,
     }
 
     fn cstr(a: &[core::ffi::c_char]) -> String {
@@ -70,6 +73,9 @@ mod imp {
                     device_name: cstr(&st.device_name),
                     view: (st.view_width, st.view_height),
                     refreshes: [0; 3],
+                    touch_swap_axes: st.touch_swap_axes,
+                    touch_mirror_x: st.touch_mirror_x,
+                    touch_mirror_y: st.touch_mirror_y,
                 })
             }
         }
@@ -89,6 +95,38 @@ mod imp {
 
         pub fn font(&self) -> &Font {
             &self.font
+        }
+
+        /// Copy of the whole framebuffer, to hand the screen back on exit.
+        pub fn save_screen(&self) -> Vec<u8> {
+            unsafe { std::slice::from_raw_parts(self.buf, self.buf_len).to_vec() }
+        }
+
+        pub fn restore_screen(&mut self, saved: &[u8]) {
+            let n = saved.len().min(self.buf_len);
+            unsafe { std::ptr::copy_nonoverlapping(saved.as_ptr(), self.buf, n) };
+            let (cols, rows) = (self.geo.cols, self.geo.rows);
+            // Refresh the full view, not just the cell grid, so margins are covered too.
+            let mut cfg = self.cfg;
+            cfg.wfm_mode = fb::WFM_MODE_INDEX_E_WFM_GC16;
+            cfg.is_flashing = true;
+            unsafe {
+                fb::fbink_refresh(self.fd, 0, 0, self.view.0, self.view.1, &cfg);
+                fb::fbink_wait_for_complete(self.fd, fb::fbink_get_last_marker());
+            }
+            let _ = (cols, rows);
+        }
+
+        /// Cell under a screen pixel, if inside the grid.
+        pub fn cell_at(&self, x: i32, y: i32) -> Option<(u16, u16)> {
+            let (fw, fh) = (self.font.width as i32, self.font.height as i32);
+            let cx = (x - self.x0 as i32) / fw;
+            let cy = (y - self.y0 as i32) / fh;
+            if x < self.x0 as i32 || y < self.y0 as i32 || cx >= self.geo.cols as i32 || cy >= self.geo.rows as i32 {
+                None
+            } else {
+                Some((cx as u16, cy as u16))
+            }
         }
 
         #[inline]

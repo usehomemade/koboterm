@@ -1,0 +1,9 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+[dependencies]
+panel.workspace = true
+anyhow.workspace = true

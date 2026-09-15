@@ -14,8 +14,10 @@ term.workspace = true
 render.workspace = true
 font.workspace = true
 transport.workspace = true
+ui.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 panel-fbink.workspace = true
+input.workspace = true

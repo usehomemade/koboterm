@@ -4,9 +4,14 @@
 
 use anyhow::Result;
 
+#[cfg(target_os = "linux")]
+mod app;
+
 fn main() -> Result<()> {
     let cmd = std::env::args().nth(1).unwrap_or_default();
     match cmd.as_str() {
+        #[cfg(target_os = "linux")]
+        "" | "app" => app::run(),
         "probe" => probe(),
         #[cfg(target_os = "linux")]
         "demo" => demo::run(),
@@ -15,6 +20,8 @@ fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         "ssh" => session::run(session::Kind::Ssh, std::env::args().skip(2).collect()),
         "keygen" => keygen(std::env::args().nth(2)),
+        #[cfg(target_os = "linux")]
+        "touch-dump" => touchdump::run(std::env::args().nth(2).unwrap_or_else(|| "/dev/input/event1".into())),
         _ => {
             eprintln!("usage: koboterm probe | demo | keygen [PATH]");
             eprintln!("       koboterm run [--type TEXT]... [--hold SECS] -- CMD [ARGS...]");
@@ -216,6 +223,58 @@ fn probe() -> Result<()> {
     #[cfg(target_os = "linux")]
     inputs();
     Ok(())
+}
+
+/// Print absolute-axis ranges and then raw events for 10 s, for mapping touch.
+#[cfg(target_os = "linux")]
+mod touchdump {
+    use anyhow::{Context, Result};
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    #[repr(C)]
+    #[derive(Default, Debug)]
+    struct AbsInfo {
+        value: i32,
+        minimum: i32,
+        maximum: i32,
+        fuzz: i32,
+        flat: i32,
+        resolution: i32,
+    }
+
+    pub fn run(path: String) -> Result<()> {
+        let f = std::fs::File::open(&path).with_context(|| path.clone())?;
+        let fd = f.as_raw_fd();
+        // EVIOCGABS(code) = _IOR('E', 0x40 + code, struct input_absinfo)
+        for (name, code) in [("ABS_X", 0x00u32), ("ABS_Y", 0x01), ("ABS_MT_SLOT", 0x2f), ("ABS_MT_POSITION_X", 0x35), ("ABS_MT_POSITION_Y", 0x36), ("ABS_MT_TRACKING_ID", 0x39)] {
+            let mut ai = AbsInfo::default();
+            let req: u32 = (2u32 << 30) | ((core::mem::size_of::<AbsInfo>() as u32) << 16) | ((b'E' as u32) << 8) | (0x40 + code);
+            if unsafe { libc::ioctl(fd, req as _, &mut ai) } == 0 {
+                println!("{name}: min={} max={} res={}", ai.minimum, ai.maximum, ai.resolution);
+            }
+        }
+        println!("tap the screen; dumping events for 10 s");
+        let mut buf = [0u8; 16 * 64];
+        let start = Instant::now();
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        while start.elapsed() < Duration::from_secs(10) {
+            if unsafe { libc::poll(&mut pfd, 1, 200) } <= 0 {
+                continue;
+            }
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            for ev in buf[..n as usize].chunks_exact(16) {
+                let ty = u16::from_le_bytes([ev[8], ev[9]]);
+                let code = u16::from_le_bytes([ev[10], ev[11]]);
+                let val = i32::from_le_bytes([ev[12], ev[13], ev[14], ev[15]]);
+                println!("t={:5} type={ty} code=0x{code:02x} val={val}", start.elapsed().as_millis());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -1,0 +1,16 @@
+[package]
+name = "koboterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "koboterm"
+path = "src/main.rs"
+
+[dependencies]
+panel.workspace = true
+term.workspace = true
+render.workspace = true
+anyhow.workspace = true
+libc.workspace = true

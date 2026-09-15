@@ -1,0 +1,17 @@
+#!/bin/sh
+# Copy a local file to the Kobo and verify its checksum.
+#
+# Goes through the ssh tty as a base64 heredoc because the device has no scp or
+# sftp-server. ~330 KB takes about a minute. For anything larger, use USB.
+#
+# usage: tools/kobo-push <local-file> <remote-path>
+set -eu
+SRC="$1"; DST="$2"
+LOCAL_MD5="$(md5 -q "$SRC" 2>/dev/null || md5sum "$SRC" | cut -d' ' -f1)"
+{
+  echo "cat > '$DST.b64' <<'EOF_B64'"
+  base64 -b 76 -i "$SRC" 2>/dev/null || base64 -w 76 "$SRC"
+  echo "EOF_B64"
+  echo "base64 -d '$DST.b64' > '$DST' && rm -f '$DST.b64' && chmod +x '$DST'"
+  echo "md5sum '$DST'"
+} | "$(dirname "$0")/kobo-sh" | tee /dev/stderr | grep -q "^$LOCAL_MD5 " && echo "pushed $SRC -> $DST (md5 ok)" || { echo "push FAILED: checksum mismatch" >&2; exit 1; }

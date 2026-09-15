@@ -4,11 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 koboterm — an SSH terminal client for Kobo e-readers. Sit with a Kobo, connect to a remote machine, and work in a terminal (the primary use case is running Claude Code over SSH). `CLAUDE.md` is a symlink to this file; edit `AGENTS.md`.
 
-**Status: greenfield.** No build, lint or test tooling exists yet. Fill in the Commands section when the toolchain lands; do not invent commands before then.
+**Status: bootstrapping.** Rust workspace; host-side tests exist for the terminal model and the refresh scheduler. Nothing draws on a device yet.
 
 ## Commands
 
-_None yet._ Record here, once they exist: build the device binary, run host-side tests, run a single test, deploy to a Kobo.
+Toolchain: Rust stable via `rustup` (Homebrew), `zig` + `cargo-zigbuild` for cross-compiling. Target is `armv7-unknown-linux-musleabihf`, fully static, so the Kobo's old glibc is irrelevant.
+
+```sh
+cargo test                                   # host-side tests (terminal model, renderer, scheduler)
+cargo test -p render streaming               # one test by name, in one crate
+cargo run -p koboterm -- probe               # host: prints uname; on device also fb + input info
+cargo zigbuild --release --target armv7-unknown-linux-musleabihf   # device binary (static, ~330 KB)
+tools/kobo-push target/armv7-unknown-linux-musleabihf/release/koboterm /tmp/koboterm   # deploy (about 1 min)
+echo "/tmp/koboterm probe" | tools/kobo-sh                                              # run on device
+```
+
+`cargo` lives in `/opt/homebrew/opt/rustup/bin`; add that to PATH.
+
+Dev device access: stock Kobo firmware ships `.kobo/ssh-disabled`; renaming it to `ssh-enabled` and rebooting gives `ssh root@<ip>` (first login asks to set a password; then add a key to `/.ssh/authorized_keys`, root's home is `/`). The device's sshd ignores non-interactive commands and has no scp/sftp, hence `tools/kobo-sh` and `tools/kobo-push`. The Kobo drops Wi-Fi when it sleeps; wake it before connecting. This is a development convenience only. End-user install must be a `KoboRoot.tgz` dropped into `.kobo/` over USB (the same route NickelMenu and KOReader use), with zero manual steps.
+
+## Dev device facts (Kobo Clara BW, model 395)
+
+Verified 2026-09-15 by running `koboterm probe` on the device:
+
+- Kernel 4.9.77, `armv7l`, 32-bit userland, glibc 2.11.1 (ancient: static musl is the right call). MediaTek MT8110 "TPV board". 448 MB RAM. Root fs 1 GB with 720 MB free; `/mnt/onboard` is the 12 GB FAT user partition.
+- Framebuffer `/dev/fb0`: driver `hwtcon` (MediaTek, not mxcfb), 1072x1448, 32 bpp, rotate=3, line_length 4288. FBInk knows this driver; do not hand-roll its ioctls.
+- Input: `event0` gpio-keys, `event1` cyttsp5_mt (touch), `event2` power key. No keyboard devices until OTG/Bluetooth work.
+- Present: busybox, wpa_supplicant, dhcpcd, hciconfig, OpenSSH 8.9 sshd. Missing: ssh client, scp, sftp-server, tmux, bluetoothd.
+- Running: `nickel` (the reader UI), `hindenburg`, `sickel`, `fontickel`, `strickel`, `wmt_launcher` (MediaTek Wi-Fi/BT combo driver daemon), `mdpd`.
+
+## Crates
+
+- `crates/panel` — `Panel` trait (cell-addressed draw + refresh with a `Waveform`), `FakePanel` that logs refreshes for tests.
+- `crates/term` — terminal model over `vt100`; `Terminal::snapshot()` returns a `Grid` of reduced cells.
+- `crates/render` — the refresh scheduler. Diffs wanted grid vs shadow grid on every tick; debounce with a latency cap; row-band coalescing; ghost budget. Tests here are the "refreshes per second" metric.
+- `crates/koboterm` — the binary. Only `probe` so far.
 
 ## The idea
 

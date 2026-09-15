@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/panel", "crates/term", "crates/render", "crates/koboterm"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+panel = { path = "crates/panel" }
+term = { path = "crates/term" }
+render = { path = "crates/render" }
+vt100 = "0.15"
+libc = "0.2"
+anyhow = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

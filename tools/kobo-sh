@@ -1,0 +1,21 @@
+#!/bin/sh
+# Run a shell script on the Kobo over ssh.
+#
+# The stock Kobo sshd ignores commands given on the ssh command line and only
+# serves an interactive shell, so this feeds the script through a forced tty and
+# strips prompts and echo from the result. No scp/sftp exist on the device.
+#
+# usage: tools/kobo-sh < script.sh        (KOBO_HOST, KOBO_KEY override defaults)
+set -eu
+HOST="${KOBO_HOST:-192.168.0.215}"
+KEY="${KOBO_KEY:-$HOME/.ssh/id_ed25519_personal}"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+{
+  echo "stty -echo"
+  echo "echo ===KOBO-BE\"\"GIN"
+  cat
+  echo "echo ===KOBO-E\"\"ND"
+  echo "exit"
+} | ssh -tt -i "$KEY" -o ConnectTimeout=8 -o BatchMode=yes "root@$HOST" > "$TMP" 2>&1 || true
+tr -d '\r' < "$TMP" | sed -n '/===KOBO-BEGIN/,/===KOBO-END/p' | sed -e '1d' -e '$d' -e 's/^\[@kobo \]# //'

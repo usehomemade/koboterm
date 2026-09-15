@@ -1,0 +1,9 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+panel.workspace = true
+term.workspace = true

@@ -16,7 +16,7 @@ use px::{PxCanvas, PxRect, PxWave};
 use pxui::popup::{EndIcon, Popup, PopupHit};
 use pxui::topbar::{BarAction, BarStatus, TopBar};
 use pxui::Fonts;
-use ui::{draw, AddForm, FormAction, Home, HomeAction, HostEntry, Osk, OskAction};
+use ui::{draw, next_session_name, AddForm, FormAction, Home, HomeAction, HostEntry, Osk, OskAction, Sessions};
 
 use crate::pair::PairServer;
 
@@ -170,21 +170,55 @@ fn stable_screen(panel: &FbinkPanel) -> Vec<u8> {
 enum Wait {
     Tap(u16, u16),
     Registered(HostEntry),
+    SessionsFetched(usize, Sessions),
     Timeout,
 }
 
+/// Background `tmux ls` per machine; results arrive on the channel.
+struct SessionFetcher {
+    tx: std::sync::mpsc::Sender<(usize, Sessions)>,
+    rx: std::sync::mpsc::Receiver<(usize, Sessions)>,
+}
+
+impl SessionFetcher {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        SessionFetcher { tx, rx }
+    }
+
+    fn fetch(&self, i: usize, entry: &HostEntry, key_path: &Path) {
+        let Some(tmux) = entry.tmux_bin().map(|s| s.to_string()) else { return };
+        let Ok(target) = SshTarget::parse(&entry.spec, key_path, None) else { return };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let cmd = format!("{tmux} ls -F '#S' 2>/dev/null; true");
+            let res = match transport::run_command(&target, &cmd, Duration::from_secs(8)) {
+                Ok(out) => Sessions::Known(out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()),
+                Err(e) => {
+                    eprintln!("tmux ls on {}: {e:#}", target.host);
+                    Sessions::Unavailable
+                }
+            };
+            let _ = tx.send((i, res));
+        });
+    }
+}
+
 fn wait_tap(panel: &FbinkPanel, touch: &mut TouchDevice, timeout: Duration) -> Option<(u16, u16)> {
-    match wait_event(panel, touch, None, timeout) {
+    match wait_event(panel, touch, None, None, timeout) {
         Wait::Tap(c, r) => Some((c, r)),
         _ => None,
     }
 }
 
-fn wait_event(panel: &FbinkPanel, touch: &mut TouchDevice, pair: Option<&PairServer>, timeout: Duration) -> Wait {
+fn wait_event(panel: &FbinkPanel, touch: &mut TouchDevice, pair: Option<&PairServer>, fetcher: Option<&SessionFetcher>, timeout: Duration) -> Wait {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if let Some(e) = pair.and_then(|p| p.try_recv()) {
             return Wait::Registered(e);
+        }
+        if let Some((i, s)) = fetcher.and_then(|f| f.rx.try_recv().ok()) {
+            return Wait::SessionsFetched(i, s);
         }
         for ev in touch.poll(Duration::from_millis(50)) {
             if let TouchEvent::Tap { x, y } = ev {
@@ -200,25 +234,49 @@ fn wait_event(panel: &FbinkPanel, touch: &mut TouchDevice, pair: Option<&PairSer
 fn main_loop(panel: &mut FbinkPanel, touch: &mut TouchDevice, hosts: &mut Vec<HostEntry>, settings: &mut Settings, ctx: &Ctx) -> Result<()> {
     let mut status = String::new();
     let pair_url = ctx.pair.as_ref().map(|p| p.url.clone()).unwrap_or_else(|| "http://<kobo-ip>:8080".into());
+    let fetcher = SessionFetcher::new();
+    let mut sessions: Vec<Sessions> = vec![Sessions::Unknown; hosts.len()];
     loop {
+        sessions.resize(hosts.len(), Sessions::Unknown);
+        for (i, h) in hosts.iter().enumerate() {
+            if sessions[i] == Sessions::Unknown && h.tmux_bin().is_some() {
+                sessions[i] = Sessions::Fetching;
+                fetcher.fetch(i, h, &ctx.key_path);
+            }
+        }
         let ui = panel.region_full(UI_FONT, settings.margin);
         panel.use_region(ui);
         let g = ui.geometry();
         let mut home = Home::new(g.cols, g.rows);
-        home.draw(panel, hosts, &ctx.pubkey, &pair_url, &status);
+        home.draw(panel, hosts, &sessions, &ctx.pubkey, &pair_url, &status);
         status.clear();
-        let (col, row) = match wait_event(panel, touch, ctx.pair.as_ref(), Duration::from_secs(3600)) {
+        let (col, row) = match wait_event(panel, touch, ctx.pair.as_ref(), Some(&fetcher), Duration::from_secs(3600)) {
             Wait::Tap(c, r) => (c, r),
             Wait::Registered(e) => {
                 match hosts.iter().position(|h| h.name == e.name) {
-                    Some(i) => hosts[i] = e.clone(),
+                    Some(i) => {
+                        hosts[i] = e.clone();
+                        sessions[i] = Sessions::Unknown;
+                    }
                     None => hosts.push(e.clone()),
                 }
                 HostEntry::save(&ctx.hosts_path, hosts)?;
                 status = format!("added {}", e.name);
                 continue;
             }
+            Wait::SessionsFetched(i, s) => {
+                if i < sessions.len() {
+                    sessions[i] = s;
+                }
+                continue;
+            }
             Wait::Timeout => continue,
+        };
+        let connect = |panel: &mut FbinkPanel, touch: &mut TouchDevice, settings: &mut Settings, entry: HostEntry| -> String {
+            match session(panel, touch, &entry, settings, ctx) {
+                Ok(()) => format!("{}: session ended", entry.name),
+                Err(e) => format!("{}: {e:#}", entry.name),
+            }
         };
         match home.hit(col, row) {
             HomeAction::Quit => return Ok(()),
@@ -235,11 +293,21 @@ fn main_loop(panel: &mut FbinkPanel, touch: &mut TouchDevice, hosts: &mut Vec<Ho
                 }
             }
             HomeAction::Connect(i) => {
-                let entry = hosts[i].clone();
-                match session(panel, touch, &entry, settings, ctx) {
-                    Ok(()) => status = format!("{}: session ended", entry.name),
-                    Err(e) => status = format!("{}: {e:#}", entry.name),
-                }
+                status = connect(panel, touch, settings, hosts[i].clone());
+                sessions[i] = Sessions::Unknown;
+            }
+            HomeAction::ConnectSession(i, name) => {
+                status = connect(panel, touch, settings, hosts[i].with_session(&name));
+                sessions[i] = Sessions::Unknown;
+            }
+            HomeAction::NewSession(i) => {
+                let existing = match &sessions[i] {
+                    Sessions::Known(v) => v.clone(),
+                    _ => Vec::new(),
+                };
+                let name = next_session_name(&existing);
+                status = connect(panel, touch, settings, hosts[i].with_session(&name));
+                sessions[i] = Sessions::Unknown;
             }
             HomeAction::Nothing => {}
         }

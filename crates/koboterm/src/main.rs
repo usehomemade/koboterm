@@ -244,8 +244,8 @@ mod shot {
         let panel = panel_fbink::FbinkPanel::open(font)?;
         let (w, h) = (panel.view.0 as usize, panel.view.1 as usize);
         let raw = panel.save_screen();
-        let stride = raw.len() / (panel.view.1 as usize + panel.view_origin().1 as usize).max(1);
-        let bpp = stride / w.max(1);
+        let stride = panel.stride();
+        let bpp = (panel.bpp() / 8) as usize;
         let (ox, oy) = (panel.view_origin().0 as usize, panel.view_origin().1 as usize);
         let (ow, oh) = (w / 2, h / 2);
         let mut img = Vec::with_capacity(ow * oh);

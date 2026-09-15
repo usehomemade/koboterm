@@ -8,7 +8,7 @@ pub mod osk;
 pub mod popup;
 pub mod topbar;
 
-pub use home::{AddForm, FormAction, Home, HomeAction, HostEntry, TextSize};
+pub use home::{next_session_name, AddForm, FormAction, Home, HomeAction, HostEntry, Sessions, TextSize};
 pub use osk::{osk_rows, Osk, OskAction, OSK_ROWS};
 pub use topbar::{Status, TopAction, TopBar, TOPBAR_ROWS};
 pub use popup::{Popup, PopupHit};

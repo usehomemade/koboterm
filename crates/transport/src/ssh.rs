@@ -217,6 +217,39 @@ impl Transport for SshTransport {
     }
 }
 
+/// Run one command on the target without a pty and return its stdout.
+/// Blocks; meant for short queries like `tmux ls`.
+pub fn run_command(target: &SshTarget, command: &str, timeout: Duration) -> Result<String> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let target = target.clone();
+    let command = command.to_string();
+    rt.block_on(async move {
+        let work = async {
+            let config = Arc::new(client::Config { inactivity_timeout: None, ..Default::default() });
+            let mut handle = client::connect(config, (target.host.as_str(), target.port), Handler).await?;
+            let key = load_secret_key(&target.key_path, None)?;
+            let hash = handle.best_supported_rsa_hash().await?.flatten();
+            let auth = handle.authenticate_publickey(&target.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await?;
+            if !auth.success() {
+                bail!("public key authentication rejected");
+            }
+            let mut channel = handle.channel_open_session().await?;
+            channel.exec(true, command.as_str()).await?;
+            let mut out = Vec::new();
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                }
+            }
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+            Ok::<_, anyhow::Error>(String::from_utf8_lossy(&out).into_owned())
+        };
+        tokio::time::timeout(timeout, work).await.map_err(|_| anyhow::anyhow!("timed out"))?
+    })
+}
+
 /// Generate an ed25519 key pair in OpenSSH format. Returns the public key line.
 pub fn keygen(path: &Path, comment: &str) -> Result<String> {
     use russh::keys::ssh_key::{Algorithm, LineEnding, PrivateKey};

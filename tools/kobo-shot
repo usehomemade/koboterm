@@ -7,7 +7,7 @@ OUT="${1:-shot.png}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 printf '/mnt/onboard/.adds/koboterm/koboterm shot /tmp/shot.pgm >/dev/null 2>&1; base64 /tmp/shot.pgm\n' | "$HERE/kobo-sh" | grep -E '^[A-Za-z0-9+/=]+$' > "$TMP/shot.b64"
-base64 -d "$TMP/shot.b64" > "$TMP/shot.pgm" 2>/dev/null || base64 -D "$TMP/shot.b64" > "$TMP/shot.pgm"
+base64 -d < "$TMP/shot.b64" > "$TMP/shot.pgm"
 python3 - "$TMP/shot.pgm" "$OUT" <<'PY'
 import sys, zlib, struct
 src, out = sys.argv[1], sys.argv[2]

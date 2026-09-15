@@ -191,6 +191,14 @@ mod imp {
             self.view_origin
         }
 
+        pub fn stride(&self) -> usize {
+            self.stride
+        }
+
+        pub fn bpp(&self) -> u32 {
+            self.bpp
+        }
+
         pub fn font(&self) -> &Font {
             &self.fonts[self.cur.font]
         }

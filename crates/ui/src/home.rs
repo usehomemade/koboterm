@@ -15,6 +15,31 @@ pub struct HostEntry {
 }
 
 impl HostEntry {
+    /// The tmux binary this entry uses (first word of its command), if any.
+    pub fn tmux_bin(&self) -> Option<&str> {
+        let c = self.command.as_deref()?;
+        let first = c.split_whitespace().next()?;
+        if first.ends_with("tmux") { Some(first) } else { None }
+    }
+
+    /// Same entry but attaching to tmux session `name` (`-s NAME` replaced).
+    pub fn with_session(&self, name: &str) -> HostEntry {
+        let mut e = self.clone();
+        if let Some(c) = &self.command {
+            let mut words: Vec<String> = c.split(' ').map(|w| w.to_string()).collect();
+            let mut i = 0;
+            while i + 1 < words.len() {
+                if words[i] == "-s" {
+                    words[i + 1] = name.to_string();
+                    break;
+                }
+                i += 1;
+            }
+            e.command = Some(words.join(" "));
+        }
+        e
+    }
+
     /// File format: one entry per line, tab separated: name, spec, command.
     pub fn load(path: &Path) -> Result<Vec<HostEntry>> {
         let Ok(s) = std::fs::read_to_string(path) else { return Ok(Vec::new()) };
@@ -42,6 +67,14 @@ impl HostEntry {
     }
 }
 
+/// "kobo", then "kobo-2", "kobo-3", ... skipping names already in use.
+pub fn next_session_name(existing: &[String]) -> String {
+    if !existing.iter().any(|s| s == "kobo") {
+        return "kobo".into();
+    }
+    (2..).map(|n| format!("kobo-{n}")).find(|n| !existing.contains(n)).unwrap()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextSize {
     Small,
@@ -66,9 +99,25 @@ impl TextSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// tmux sessions known for a machine, filled in asynchronously.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Sessions {
+    #[default]
+    Unknown,
+    Fetching,
+    /// Names of live tmux sessions on the machine (may be empty).
+    Known(Vec<String>),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HomeAction {
+    /// Machine header: connect with its default command.
     Connect(usize),
+    /// A listed tmux session on machine `i`.
+    ConnectSession(usize, String),
+    /// "+ new session" on machine `i`.
+    NewSession(usize),
     Add,
     Quit,
     Text,
@@ -83,19 +132,59 @@ pub struct Home {
     cols: u16,
     rows: u16,
     n: usize,
+    /// Per machine: header rect, then one rect per sub-row (sessions, then "+ new").
+    blocks: Vec<(CellRect, Vec<(CellRect, SubRow)>)>,
+    add: CellRect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SubRow {
+    Session(String),
+    New,
+    Note(String),
 }
 
 impl Home {
     pub fn new(cols: u16, rows: u16) -> Self {
-        Home { cols, rows, n: 0 }
+        Home { cols, rows, n: 0, blocks: Vec::new(), add: CellRect { col: 1, row: LIST_TOP, cols: cols - 2, rows: ENTRY_H } }
     }
 
-    fn entry_rect(&self, i: usize) -> CellRect {
-        CellRect { col: 1, row: LIST_TOP + i as u16 * ENTRY_H, cols: self.cols - 2, rows: ENTRY_H }
+    /// Lay out machines with their session rows; call before drawing/hit-testing.
+    pub fn layout(&mut self, hosts: &[HostEntry], sessions: &[Sessions]) {
+        self.n = hosts.len();
+        self.blocks.clear();
+        let mut row = LIST_TOP;
+        for (i, h) in hosts.iter().enumerate() {
+            let header = CellRect { col: 1, row, cols: self.cols - 2, rows: ENTRY_H };
+            row += ENTRY_H;
+            let mut subs = Vec::new();
+            let uses_tmux = h.command.as_deref().map(|c| c.contains("tmux")).unwrap_or(false);
+            if uses_tmux {
+                let mut push = |sr: SubRow, row: &mut u16| {
+                    subs.push((CellRect { col: 1, row: *row, cols: self.cols - 2, rows: 1 }, sr));
+                    *row += 1;
+                };
+                match sessions.get(i).cloned().unwrap_or_default() {
+                    Sessions::Unknown | Sessions::Fetching => push(SubRow::Note("looking for tmux sessions...".into()), &mut row),
+                    Sessions::Unavailable => push(SubRow::Note("(machine not reachable)".into()), &mut row),
+                    Sessions::Known(names) => {
+                        for n in names {
+                            push(SubRow::Session(n), &mut row);
+                        }
+                    }
+                }
+                if !matches!(sessions.get(i), Some(Sessions::Unavailable)) {
+                    push(SubRow::New, &mut row);
+                }
+                row += 1;
+            }
+            self.blocks.push((header, subs));
+        }
+        self.add = CellRect { col: 1, row, cols: self.cols - 2, rows: ENTRY_H };
     }
 
     fn add_rect(&self) -> CellRect {
-        self.entry_rect(self.n)
+        self.add
     }
 
     fn quit_rect(&self) -> CellRect {
@@ -110,8 +199,8 @@ impl Home {
         CellRect { col: self.cols - 6, row: 0, cols: 6, rows: 3 }
     }
 
-    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], pubkey: &str, pair_url: &str, status: &str) {
-        self.n = hosts.len();
+    pub fn draw(&mut self, panel: &mut dyn Panel, hosts: &[HostEntry], sessions: &[Sessions], pubkey: &str, pair_url: &str, status: &str) {
+        self.layout(hosts, sessions);
         let full = CellRect { col: 0, row: 0, cols: self.cols, rows: self.rows };
         draw::fill(panel, full, ' ', false);
         draw::text(panel, 1, 1, "koboterm", true, false);
@@ -121,11 +210,18 @@ impl Home {
         draw::button(panel, self.brightness_rect(), "☼", false);
         draw::text(panel, 1, 4, "Machines", false, false);
         for (i, h) in hosts.iter().enumerate() {
-            let r = self.entry_rect(i);
-            draw::frame(panel, r, false);
+            let (r, subs) = &self.blocks[i];
+            draw::frame(panel, *r, false);
             draw::text(panel, r.col + 2, r.row + 1, &h.name, true, false);
             let spec_col = r.col + r.cols - 2 - h.spec.chars().count() as u16;
             draw::text(panel, spec_col.max(r.col + 3 + h.name.chars().count() as u16), r.row + 1, &h.spec, false, false);
+            for (sr, sub) in subs {
+                match sub {
+                    SubRow::Session(n) => draw::text(panel, sr.col + 4, sr.row, &format!("▸ tmux: {n}"), false, false),
+                    SubRow::New => draw::text(panel, sr.col + 4, sr.row, "+ new tmux session", false, false),
+                    SubRow::Note(t) => draw::text(panel, sr.col + 4, sr.row, t, false, false),
+                }
+            }
         }
         draw::button(panel, self.add_rect(), "+ add a machine", false);
         let width = (self.cols - 2) as usize;
@@ -152,9 +248,18 @@ impl Home {
     }
 
     pub fn hit(&self, col: u16, row: u16) -> HomeAction {
-        for i in 0..self.n {
-            if self.entry_rect(i).contains(col, row) {
+        for (i, (header, subs)) in self.blocks.iter().enumerate() {
+            if header.contains(col, row) {
                 return HomeAction::Connect(i);
+            }
+            for (sr, sub) in subs {
+                if sr.contains(col, row) {
+                    return match sub {
+                        SubRow::Session(n) => HomeAction::ConnectSession(i, n.clone()),
+                        SubRow::New => HomeAction::NewSession(i),
+                        SubRow::Note(_) => HomeAction::Nothing,
+                    };
+                }
             }
         }
         if self.add_rect().contains(col, row) {
@@ -329,7 +434,7 @@ mod tests {
         let mut fp = FakePanel::new(67, 45);
         let mut h = Home::new(67, 45);
         let hosts = vec![HostEntry { name: "MacBook".into(), spec: "tunc@10.0.0.2".into(), command: None }];
-        h.draw(&mut fp, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
+        h.draw(&mut fp, &hosts, &[Sessions::Unknown], "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
         assert!((0..45).any(|r| fp.row_text(r).contains("curl -fsSL http://10.0.0.9:8080/install.sh | sh")));
         assert!(fp.row_text(6).contains("MacBook"));
         assert!(fp.row_text(6).contains("tunc@10.0.0.2"));
@@ -342,8 +447,35 @@ mod tests {
         // Small grid (large text) still lays out without panicking.
         let mut fp2 = FakePanel::new(43, 29);
         let mut h2 = Home::new(43, 29);
-        h2.draw(&mut fp2, &hosts, "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
+        h2.draw(&mut fp2, &hosts, &[Sessions::Unknown], "ssh-ed25519 AAAAtest koboterm", "http://10.0.0.9:8080", "");
         assert!(fp2.row_text(6).contains("MacBook"));
+    }
+
+    #[test]
+    fn session_substitution_and_naming() {
+        let e = HostEntry { name: "MBP".into(), spec: "t@h".into(), command: Some("/opt/homebrew/bin/tmux -u new -A -s kobo \\; set -g mouse on".into()) };
+        assert_eq!(e.tmux_bin(), Some("/opt/homebrew/bin/tmux"));
+        assert_eq!(e.with_session("work").command.as_deref(), Some("/opt/homebrew/bin/tmux -u new -A -s work \\; set -g mouse on"));
+        assert_eq!(next_session_name(&[]), "kobo");
+        assert_eq!(next_session_name(&["kobo".into()]), "kobo-2");
+        assert_eq!(next_session_name(&["kobo".into(), "kobo-2".into()]), "kobo-3");
+        let plain = HostEntry { name: "x".into(), spec: "t@h".into(), command: None };
+        assert_eq!(plain.tmux_bin(), None);
+    }
+
+    #[test]
+    fn tmux_machines_list_their_sessions() {
+        let mut fp = FakePanel::new(67, 45);
+        let mut h = Home::new(67, 45);
+        let hosts = vec![HostEntry { name: "MBP".into(), spec: "tunc@10.0.0.2".into(), command: Some("/opt/homebrew/bin/tmux -u new -A -s kobo".into()) }];
+        h.draw(&mut fp, &hosts, &[Sessions::Known(vec!["kobo".into(), "work".into()])], "k", "u", "");
+        assert!(fp.row_text(8).contains("tmux: kobo"), "{:?}", fp.row_text(8));
+        assert!(fp.row_text(9).contains("tmux: work"));
+        assert!(fp.row_text(10).contains("new tmux session"));
+        assert_eq!(h.hit(10, 9), HomeAction::ConnectSession(0, "work".into()));
+        assert_eq!(h.hit(10, 10), HomeAction::NewSession(0));
+        assert_eq!(h.hit(10, 6), HomeAction::Connect(0));
+        assert!(fp.row_text(13).contains("add a machine"), "{:?}", fp.row_text(13));
         assert_eq!(fp.count(Waveform::Full), 1);
     }
 

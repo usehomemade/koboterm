@@ -5,6 +5,8 @@
 pub mod draw;
 pub mod home;
 pub mod osk;
+pub mod topbar;
 
 pub use home::{AddForm, FormAction, Home, HomeAction, HostEntry, TextSize};
 pub use osk::{osk_rows, Osk, OskAction, OSK_ROWS};
+pub use topbar::{Status, TopAction, TopBar, TOPBAR_ROWS};

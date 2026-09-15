@@ -44,6 +44,10 @@ enum Cmd {
     Resize(u16, u16),
 }
 
+/// `exit_status()` value when the connection ended without the remote
+/// reporting an exit status: the link was lost, not the command finished.
+pub const LOST: i32 = -1;
+
 pub struct SshTransport {
     from_server: mpsc::Receiver<Vec<u8>>,
     to_server: tmpsc::UnboundedSender<Cmd>,
@@ -84,10 +88,10 @@ impl SshTransport {
                 let mut st = status2.lock().unwrap();
                 if st.is_none() {
                     *st = Some(match outcome {
-                        Ok(()) => 0,
+                        Ok(()) => LOST,
                         Err(e) => {
                             eprintln!("ssh: {e:#}");
-                            255
+                            LOST
                         }
                     });
                 }
@@ -114,8 +118,10 @@ async fn session(
             keepalive_max: 3,
             ..Default::default()
         });
-        let mut handle = client::connect(config, (target.host.as_str(), target.port), Handler)
+        let mut handle = tokio::time::timeout(Duration::from_secs(12), client::connect(config, (target.host.as_str(), target.port), Handler))
             .await
+            .map_err(|_| anyhow::anyhow!("timed out"))
+            .and_then(|r| r.map_err(anyhow::Error::from))
             .with_context(|| format!("connect {}:{}", target.host, target.port))?;
         let key = load_secret_key(&target.key_path, None).with_context(|| format!("load key {}", target.key_path.display()))?;
         let hash = handle.best_supported_rsa_hash().await?.flatten();

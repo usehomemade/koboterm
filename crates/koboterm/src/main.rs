@@ -10,6 +10,8 @@ mod app;
 mod pair;
 #[cfg(target_os = "linux")]
 mod nickel;
+#[cfg(target_os = "linux")]
+mod device;
 
 fn main() -> Result<()> {
     let cmd = std::env::args().nth(1).unwrap_or_default();

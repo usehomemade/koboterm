@@ -92,6 +92,12 @@ impl Osk {
         Self::new_sized(cols, rows, rows - osk_rows(cols, rows))
     }
 
+    /// Keyboard at row 0 of its own region, sized as if it sat at the bottom of
+    /// a full grid of `rows_full` rows (key height depends on the full grid).
+    pub fn top(cols: u16, rows_full: u16) -> Self {
+        Self::new_sized(cols, rows_full, 0)
+    }
+
     /// Keyboard starting at `top_row` on the classic 67x45 grid.
     pub fn new(cols: u16, top_row: u16) -> Self {
         Self::new_sized(cols, 45, top_row)
@@ -179,6 +185,10 @@ impl Osk {
                 panel.refresh(p.rect, Waveform::Fast);
             }
         }
+    }
+
+    pub fn key_is_home(&self, i: usize) -> bool {
+        self.keys[i].key == Key::Home
     }
 
     pub fn hit(&self, col: u16, row: u16) -> Option<usize> {

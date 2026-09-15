@@ -74,6 +74,37 @@ pub trait Panel {
     fn refresh(&mut self, rect: CellRect, wf: Waveform);
 }
 
+/// A panel view shifted down by `row0` rows and limited to `rows` rows, so a
+/// renderer can own a band of the screen (e.g. below a top bar).
+pub struct Offset<'a> {
+    inner: &'a mut dyn Panel,
+    row0: u16,
+    rows: u16,
+}
+
+impl<'a> Offset<'a> {
+    pub fn new(inner: &'a mut dyn Panel, row0: u16, rows: u16) -> Self {
+        Offset { inner, row0, rows }
+    }
+}
+
+impl Panel for Offset<'_> {
+    fn geometry(&self) -> Geometry {
+        Geometry { cols: self.inner.geometry().cols, rows: self.rows }
+    }
+    fn draw(&mut self, col: u16, row: u16, cell: &Cell) {
+        if row < self.rows {
+            self.inner.draw(col, row + self.row0, cell);
+        }
+    }
+    fn refresh(&mut self, rect: CellRect, wf: Waveform) {
+        let rows = rect.rows.min(self.rows.saturating_sub(rect.row));
+        if rows > 0 {
+            self.inner.refresh(CellRect { row: rect.row + self.row0, rows, ..rect }, wf);
+        }
+    }
+}
+
 /// Host-side panel. Keeps the cell grid and a log of every refresh.
 #[derive(Clone, Debug)]
 pub struct FakePanel {

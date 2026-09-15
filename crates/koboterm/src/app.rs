@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use input::{TouchDevice, TouchEvent, TouchMap};
 use panel::{CellRect, Panel, Waveform};
-use panel_fbink::FbinkPanel;
+use panel_fbink::{FbinkPanel, Region};
 use render::{Config, Renderer};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -17,6 +17,8 @@ use crate::pair::PairServer;
 
 const TOUCH_DEV: &str = "/dev/input/event1";
 const SWIPE_MIN_PX: i32 = 60;
+const UI_FONT: usize = 0;
+const TERM_FONT: usize = 1;
 
 fn data_dir() -> PathBuf {
     let onboard = PathBuf::from("/mnt/onboard/.adds/koboterm");
@@ -54,7 +56,7 @@ impl Settings {
         let _ = std::fs::write(path, format!("size={}\nmargin={}\n", self.size.name(), self.margin));
     }
 
-    fn font(&self) -> font::Font {
+    fn term_font(&self) -> font::Font {
         match self.size {
             TextSize::Small => font::Font::from_bdf(font::SPLEEN_12X24),
             TextSize::Medium => font::Font::from_bdf(font::SPLEEN_16X32),
@@ -84,7 +86,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let mut hosts = HostEntry::load(&hosts_path)?;
     let mut settings = Settings::load(&settings_path);
 
-    let mut panel = FbinkPanel::open_with_margin(settings.font(), settings.margin)?;
+    // Font 0 is the UI font (home screen, keyboard); font 1 is the terminal's.
+    let mut panel = FbinkPanel::open_with_margin(font::Font::from_bdf(font::SPLEEN_16X32), settings.margin)?;
+    let term_font_idx = panel.add_font(settings.term_font());
+    debug_assert_eq!(term_font_idx, TERM_FONT);
     let saved = stable_screen(&panel);
     let mut paused = crate::nickel::pause(nickel_mode);
     let map = TouchMap {
@@ -104,7 +109,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
     };
 
-    let ctx = Ctx { hosts_path, settings_path, key_path, pubkey, pair };
+    let ctx = Ctx { hosts_path, settings_path, key_path, pubkey, pair, margin: settings.margin };
     let result = main_loop(&mut panel, &mut touch, &mut hosts, &mut settings, &ctx);
 
     let _ = touch.grab(false);
@@ -119,6 +124,7 @@ struct Ctx {
     key_path: PathBuf,
     pubkey: String,
     pair: Option<PairServer>,
+    margin: u32,
 }
 
 /// Snapshot of the framebuffer taken once Nickel has stopped drawing (the
@@ -175,7 +181,9 @@ fn main_loop(panel: &mut FbinkPanel, touch: &mut TouchDevice, hosts: &mut Vec<Ho
     let mut status = String::new();
     let pair_url = ctx.pair.as_ref().map(|p| p.url.clone()).unwrap_or_else(|| "http://<kobo-ip>:8080".into());
     loop {
-        let g = panel.geometry();
+        let ui = panel.region_full(UI_FONT, ctx.margin);
+        panel.use_region(ui);
+        let g = ui.geometry();
         let mut home = Home::new(g.cols, g.rows);
         home.draw(panel, hosts, &ctx.pubkey, &pair_url, &status, settings.size);
         status.clear();
@@ -198,7 +206,7 @@ fn main_loop(panel: &mut FbinkPanel, touch: &mut TouchDevice, hosts: &mut Vec<Ho
                 if size != settings.size {
                     settings.size = size;
                     settings.save(&ctx.settings_path);
-                    panel.set_font(settings.font(), settings.margin);
+                    panel.replace_font(TERM_FONT, settings.term_font());
                 }
             }
             HomeAction::Add => {
@@ -209,7 +217,7 @@ fn main_loop(panel: &mut FbinkPanel, touch: &mut TouchDevice, hosts: &mut Vec<Ho
             }
             HomeAction::Connect(i) => {
                 let entry = hosts[i].clone();
-                match session(panel, touch, &entry, &ctx.key_path) {
+                match session(panel, touch, &entry, &ctx.key_path, ctx.margin) {
                     Ok(()) => status = format!("{}: session ended", entry.name),
                     Err(e) => status = format!("{}: {e:#}", entry.name),
                 }
@@ -278,77 +286,99 @@ fn add_form(panel: &mut FbinkPanel, touch: &mut TouchDevice) -> Result<Option<Ho
 }
 
 /// Connect; if the remote command (tmux) is missing, fall back to a plain shell.
-fn session(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, key_path: &Path) -> Result<()> {
-    match session_with(panel, touch, entry, key_path, entry.command.clone())? {
+fn session(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, key_path: &Path, margin: u32) -> Result<()> {
+    match session_with(panel, touch, entry, key_path, entry.command.clone(), margin)? {
         Some(127) if entry.command.is_some() => {
             eprintln!("remote command {:?} not found; falling back to a login shell", entry.command);
-            session_with(panel, touch, entry, key_path, None).map(|_| ())
+            session_with(panel, touch, entry, key_path, None, margin).map(|_| ())
         }
         _ => Ok(()),
     }
 }
 
+/// Screen split for a session: terminal band on top (terminal font), keyboard
+/// band at the bottom (UI font). With the keyboard hidden the terminal takes
+/// the whole view.
 struct Layout {
     osk_visible: bool,
-    term_rows: u16,
+    term: Region,
+    osk: Region,
 }
 
-fn relayout(panel: &mut FbinkPanel, osk: &Osk, osk_visible: bool, term: &mut Terminal, tr: &mut dyn Transport, now: u64) -> Result<(Renderer, Layout)> {
-    let g = panel.geometry();
-    let term_rows = if osk_visible { g.rows - osk.height() } else { g.rows };
-    term.resize(g.cols, term_rows);
-    tr.resize(g.cols, term_rows)?;
-    let mut renderer = Renderer::new(Config::default(), g.cols, term_rows);
-    draw::fill(panel, CellRect { col: 0, row: 0, cols: g.cols, rows: g.rows }, ' ', false);
-    if osk_visible {
+impl Layout {
+    fn compute(panel: &FbinkPanel, margin: u32, osk_visible: bool, osk_rows: u16) -> Layout {
+        let ui = panel.region_full(UI_FONT, margin);
+        let osk_px = osk_rows as u32 * ui.fh;
+        let bottom = panel.view.1.saturating_sub(margin);
+        let osk_top = bottom.saturating_sub(osk_px);
+        let osk = panel.region(UI_FONT, margin, osk_top, bottom);
+        let term_bottom = if osk_visible { osk_top.saturating_sub(ui.fh / 2) } else { bottom };
+        let term = panel.region(TERM_FONT, margin, margin, term_bottom);
+        Layout { osk_visible, term, osk }
+    }
+}
+
+/// Wipe the view, draw the keyboard if visible, redraw the terminal with a full refresh.
+fn relayout(panel: &mut FbinkPanel, layout: &Layout, osk: &Osk, term: &mut Terminal, tr: &mut dyn Transport, now: u64) -> Result<Renderer> {
+    term.resize(layout.term.cols, layout.term.rows);
+    tr.resize(layout.term.cols, layout.term.rows)?;
+    let full = panel.region_full(UI_FONT, 0);
+    panel.use_region(full);
+    draw::fill(panel, CellRect { col: 0, row: 0, cols: full.cols, rows: full.rows }, ' ', false);
+    if layout.osk_visible {
+        panel.use_region(layout.osk);
         osk.draw(panel);
     }
+    panel.use_region(layout.term);
+    let mut renderer = Renderer::new(Config::default(), layout.term.cols, layout.term.rows);
     let grid = term.snapshot();
     renderer.redraw_full(now, &grid, panel);
-    Ok((renderer, Layout { osk_visible, term_rows }))
+    Ok(renderer)
 }
 
 /// Returns the remote exit status if the far end ended the session quickly
 /// (used for the tmux fallback), None otherwise.
-fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, key_path: &Path, command: Option<String>) -> Result<Option<i32>> {
-    let g = panel.geometry();
+fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, key_path: &Path, command: Option<String>, margin: u32) -> Result<Option<i32>> {
+    let ui = panel.region_full(UI_FONT, margin);
+    panel.use_region(ui);
     panel.clear()?;
     draw::text(panel, 1, 1, &format!("connecting to {} ({})...", entry.name, entry.spec), true, false);
-    panel.refresh(CellRect { col: 0, row: 0, cols: g.cols, rows: 3 }, Waveform::Fast);
+    panel.refresh(CellRect { col: 0, row: 0, cols: ui.cols, rows: 3 }, Waveform::Fast);
 
-    let mut osk = Osk::bottom(g.cols, g.rows);
-    let term_rows = g.rows - osk.height();
+    let mut osk = Osk::new(ui.cols, 0);
+    let mut layout = Layout::compute(panel, margin, true, osk.height());
     let target = SshTarget::parse(&entry.spec, key_path, command)?;
-    let mut tr = SshTransport::connect(target, g.cols, term_rows)?;
-    let mut term = Terminal::new(g.cols, term_rows, 5000);
-    let mut renderer = Renderer::new(Config::default(), g.cols, term_rows);
-    let mut layout = Layout { osk_visible: true, term_rows };
+    let mut tr = SshTransport::connect(target, layout.term.cols, layout.term.rows)?;
+    let mut term = Terminal::new(layout.term.cols, layout.term.rows, 5000);
     panel.clear()?;
-    osk.draw(panel);
-
     let t0 = Instant::now();
     let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
+    let mut renderer = relayout(panel, &layout, &osk, &mut term, &mut tr, ms(t0))?;
+
     let mut buf = [0u8; 8192];
     let mut pending_release: Vec<(usize, u64)> = Vec::new();
     let mut finger_down: Option<(i32, i32)> = None;
-    let cell_h = panel.font().height as i32;
     loop {
         let n = tr.read(&mut buf, Duration::from_millis(10))?;
         if n > 0 {
             term.feed(&buf[..n]);
         }
+        panel.use_region(layout.term);
         let grid = term.snapshot();
         renderer.tick(ms(t0), &grid, panel);
 
         let now = ms(t0);
-        pending_release.retain(|&(k, at)| {
-            if now >= at {
-                osk.release(panel, k);
-                false
-            } else {
-                true
-            }
-        });
+        if pending_release.iter().any(|&(_, at)| now >= at) {
+            panel.use_region(layout.osk);
+            pending_release.retain(|&(k, at)| {
+                if now >= at {
+                    osk.release(panel, k);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
 
         for ev in touch.poll(Duration::from_millis(0)) {
             match ev {
@@ -357,12 +387,12 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
                     let Some((sx, sy)) = finger_down.take() else { continue };
                     let dy = y - sy;
                     let dx = x - sx;
-                    if dy.abs() >= SWIPE_MIN_PX && dy.abs() > dx.abs() {
+                    if dy.abs() >= SWIPE_MIN_PX && dy.abs() > dx.abs() && panel.cell_in(&layout.term, sx, sy).is_some() {
                         // Swipe on the terminal: finger down = older content.
-                        let lines = (dy.abs() / cell_h).max(1);
+                        let lines = (dy.abs() / layout.term.fh as i32).max(1);
                         let older = dy > 0;
-                        let (col, row) = panel.cell_at(x, y).unwrap_or((0, 0));
-                        if let Some(bytes) = term.mouse_wheel_bytes(older, col, row.min(layout.term_rows.saturating_sub(1))) {
+                        let (col, row) = panel.cell_in(&layout.term, x, y).unwrap_or((0, 0));
+                        if let Some(bytes) = term.mouse_wheel_bytes(older, col, row) {
                             for _ in 0..lines {
                                 tr.write_all(&bytes)?;
                             }
@@ -372,26 +402,22 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
                     }
                 }
                 TouchEvent::Tap { x, y } => {
-                    let Some((col, row)) = panel.cell_at(x, y) else { continue };
-                    let on_osk = layout.osk_visible && osk.hit(col, row).is_some();
-                    if !on_osk {
-                        for (k, _) in pending_release.drain(..) {
-                            let _ = k;
-                        }
-                        let (r, l) = relayout(panel, &osk, !layout.osk_visible, &mut term, &mut tr, ms(t0))?;
-                        renderer = r;
-                        layout = l;
+                    let osk_hit = if layout.osk_visible { panel.cell_in(&layout.osk, x, y).and_then(|(c, r)| osk.hit(c, r)) } else { None };
+                    let Some(k) = osk_hit else {
+                        // Tap anywhere else toggles the keyboard with a full-page refresh.
+                        pending_release.clear();
+                        layout = Layout::compute(panel, margin, !layout.osk_visible, osk.height());
+                        renderer = relayout(panel, &layout, &osk, &mut term, &mut tr, ms(t0))?;
                         continue;
-                    }
-                    let Some(k) = osk.hit(col, row) else { continue };
+                    };
+                    panel.use_region(layout.osk);
                     osk.flash(panel, k);
                     match osk.press(k) {
                         OskAction::Home => return Ok(None),
                         OskAction::Hide => {
                             pending_release.clear();
-                            let (r, l) = relayout(panel, &osk, false, &mut term, &mut tr, ms(t0))?;
-                            renderer = r;
-                            layout = l;
+                            layout = Layout::compute(panel, margin, false, osk.height());
+                            renderer = relayout(panel, &layout, &osk, &mut term, &mut tr, ms(t0))?;
                         }
                         OskAction::ModifierChanged => {
                             osk.draw_modifiers(panel);
@@ -413,11 +439,12 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
             if st == 127 && ms(t0) < 5000 {
                 return Ok(Some(st));
             }
+            panel.use_region(layout.term);
             let grid = term.snapshot();
             renderer.tick(ms(t0) + 10_000, &grid, panel);
-            let r = layout.term_rows.saturating_sub(1);
+            let r = layout.term.rows.saturating_sub(1);
             draw::text(panel, 1, r, &format!("[session ended ({st}); tap to go home]"), true, true);
-            panel.refresh(CellRect { col: 0, row: r, cols: g.cols, rows: 1 }, Waveform::Fast);
+            panel.refresh(CellRect { col: 0, row: r, cols: layout.term.cols, rows: 1 }, Waveform::Fast);
             wait_tap(panel, touch, Duration::from_secs(3600));
             return Ok(Some(st));
         }

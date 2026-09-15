@@ -11,6 +11,29 @@ mod imp {
     use font::Font;
     use panel::{Cell, CellRect, Geometry, Panel, Waveform};
 
+    /// A cell grid placed somewhere on the screen with one of the panel's fonts.
+    /// The panel draws into whichever region is current; the app switches
+    /// regions to mix a large-font terminal with a normal-font keyboard.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Region {
+        pub font: usize,
+        pub x0: u32,
+        pub y0: u32,
+        pub cols: u16,
+        pub rows: u16,
+        pub fw: u32,
+        pub fh: u32,
+    }
+
+    impl Region {
+        pub fn px_height(&self) -> u32 {
+            self.rows as u32 * self.fh
+        }
+        pub fn geometry(&self) -> Geometry {
+            Geometry { cols: self.cols, rows: self.rows }
+        }
+    }
+
     pub struct FbinkPanel {
         fd: core::ffi::c_int,
         cfg: fb::FBInkConfig,
@@ -19,11 +42,8 @@ mod imp {
         stride: usize,
         bpp: u32,
         inverted_gray: bool,
-        font: Font,
-        geo: Geometry,
-        x0: u32,
-        y0: u32,
-        margin: u32,
+        fonts: Vec<Font>,
+        cur: Region,
         view_origin: (u32, u32),
         pub device_name: String,
         pub view: (u32, u32),
@@ -60,7 +80,9 @@ mod imp {
                 if buf.is_null() {
                     bail!("fbink_get_fb_pointer returned null");
                 }
-                let (cols, rows, x0, y0) = Self::layout(&font, margin, st.view_width, st.view_height, st.view_hori_origin as u32, st.view_vert_origin as u32);
+                let view = (st.view_width, st.view_height);
+                let origin = (st.view_hori_origin as u32, st.view_vert_origin as u32);
+                let cur = Self::band(&font, 0, margin, 0, view.1, view, origin);
                 Ok(FbinkPanel {
                     fd,
                     cfg,
@@ -69,14 +91,11 @@ mod imp {
                     stride: st.scanline_stride as usize,
                     bpp: st.bpp,
                     inverted_gray: st.inverted_grayscale,
-                    font,
-                    geo: Geometry { cols, rows },
-                    x0,
-                    y0,
-                    margin,
-                    view_origin: (st.view_hori_origin as u32, st.view_vert_origin as u32),
+                    fonts: vec![font],
+                    cur,
+                    view_origin: origin,
                     device_name: cstr(&st.device_name),
-                    view: (st.view_width, st.view_height),
+                    view,
                     refreshes: [0; 3],
                     touch_swap_axes: st.touch_swap_axes,
                     touch_mirror_x: st.touch_mirror_x,
@@ -85,23 +104,64 @@ mod imp {
             }
         }
 
-        fn layout(font: &Font, margin: u32, vw: u32, vh: u32, ox: u32, oy: u32) -> (u16, u16, u32, u32) {
+        /// Grid that fits inside the horizontal band [top_px, bottom_px) of the
+        /// view, with `margin` px kept free on the left and right; rows are
+        /// top-aligned in the band, columns centred.
+        fn band(font: &Font, font_idx: usize, margin: u32, top_px: u32, bottom_px: u32, view: (u32, u32), origin: (u32, u32)) -> Region {
             let (fw, fh) = (font.width as u32, font.height as u32);
-            let cols = (vw.saturating_sub(2 * margin) / fw) as u16;
-            let rows = (vh.saturating_sub(2 * margin) / fh) as u16;
-            let x0 = ox + (vw - cols as u32 * fw) / 2;
-            let y0 = oy + (vh - rows as u32 * fh) / 2;
-            (cols, rows, x0, y0)
+            let cols = (view.0.saturating_sub(2 * margin) / fw) as u16;
+            let rows = (bottom_px.saturating_sub(top_px) / fh) as u16;
+            let x0 = origin.0 + (view.0 - cols as u32 * fw) / 2;
+            let y0 = origin.1 + top_px;
+            Region { font: font_idx, x0, y0, cols, rows, fw, fh }
         }
 
-        /// Switch font (text size) and recompute the grid. Screen content is not redrawn.
-        pub fn set_font(&mut self, font: Font, margin: u32) {
-            let (cols, rows, x0, y0) = Self::layout(&font, margin, self.view.0, self.view.1, self.view_origin.0, self.view_origin.1);
-            self.font = font;
-            self.margin = margin;
-            self.geo = Geometry { cols, rows };
-            self.x0 = x0;
-            self.y0 = y0;
+        /// Register a font; returns its index for `region`. Index 0 is the font passed to `open`.
+        pub fn add_font(&mut self, font: Font) -> usize {
+            self.fonts.push(font);
+            self.fonts.len() - 1
+        }
+
+        pub fn replace_font(&mut self, idx: usize, font: Font) {
+            self.fonts[idx] = font;
+        }
+
+        /// Region covering the band [top_px, bottom_px) of the view with the given font.
+        pub fn region(&self, font_idx: usize, margin: u32, top_px: u32, bottom_px: u32) -> Region {
+            Self::band(&self.fonts[font_idx], font_idx, margin, top_px, bottom_px.min(self.view.1), self.view, self.view_origin)
+        }
+
+        /// Whole view with `margin` px on every side.
+        pub fn region_full(&self, font_idx: usize, margin: u32) -> Region {
+            self.region(font_idx, margin, margin, self.view.1.saturating_sub(margin))
+        }
+
+        pub fn use_region(&mut self, r: Region) {
+            self.cur = r;
+        }
+
+        pub fn current_region(&self) -> Region {
+            self.cur
+        }
+
+        pub fn font_of(&self, r: &Region) -> &Font {
+            &self.fonts[r.font]
+        }
+
+        /// Cell of `r` under a screen pixel, if inside that region.
+        pub fn cell_in(&self, r: &Region, x: i32, y: i32) -> Option<(u16, u16)> {
+            let cx = (x - r.x0 as i32) / r.fw as i32;
+            let cy = (y - r.y0 as i32) / r.fh as i32;
+            if x < r.x0 as i32 || y < r.y0 as i32 || cx >= r.cols as i32 || cy >= r.rows as i32 {
+                None
+            } else {
+                Some((cx as u16, cy as u16))
+            }
+        }
+
+        /// Blank the whole view (not just the current region) and flash-refresh it.
+        pub fn clear_all(&mut self) -> Result<()> {
+            self.clear()
         }
 
         /// White the whole screen with a flashing full refresh.
@@ -118,7 +178,7 @@ mod imp {
         }
 
         pub fn font(&self) -> &Font {
-            &self.font
+            &self.fonts[self.cur.font]
         }
 
         /// Copy of the whole framebuffer, to hand the screen back on exit.
@@ -129,7 +189,6 @@ mod imp {
         pub fn restore_screen(&mut self, saved: &[u8]) {
             let n = saved.len().min(self.buf_len);
             unsafe { std::ptr::copy_nonoverlapping(saved.as_ptr(), self.buf, n) };
-            let (cols, rows) = (self.geo.cols, self.geo.rows);
             // Refresh the full view, not just the cell grid, so margins are covered too.
             let mut cfg = self.cfg;
             cfg.wfm_mode = fb::WFM_MODE_INDEX_E_WFM_GC16;
@@ -138,19 +197,11 @@ mod imp {
                 fb::fbink_refresh(self.fd, 0, 0, self.view.0, self.view.1, &cfg);
                 fb::fbink_wait_for_complete(self.fd, fb::fbink_get_last_marker());
             }
-            let _ = (cols, rows);
         }
 
-        /// Cell under a screen pixel, if inside the grid.
+        /// Cell of the current region under a screen pixel.
         pub fn cell_at(&self, x: i32, y: i32) -> Option<(u16, u16)> {
-            let (fw, fh) = (self.font.width as i32, self.font.height as i32);
-            let cx = (x - self.x0 as i32) / fw;
-            let cy = (y - self.y0 as i32) / fh;
-            if x < self.x0 as i32 || y < self.y0 as i32 || cx >= self.geo.cols as i32 || cy >= self.geo.rows as i32 {
-                None
-            } else {
-                Some((cx as u16, cy as u16))
-            }
+            self.cell_in(&self.cur, x, y)
         }
 
         #[inline]
@@ -184,18 +235,22 @@ mod imp {
         }
 
         fn px_rect(&self, r: CellRect) -> (u32, u32, u32, u32) {
-            let (fw, fh) = (self.font.width as u32, self.font.height as u32);
-            (self.y0 + r.row as u32 * fh, self.x0 + r.col as u32 * fw, r.cols as u32 * fw, r.rows as u32 * fh)
+            let c = self.cur;
+            (c.y0 + r.row as u32 * c.fh, c.x0 + r.col as u32 * c.fw, r.cols as u32 * c.fw, r.rows as u32 * c.fh)
         }
     }
 
     impl Panel for FbinkPanel {
         fn geometry(&self) -> Geometry {
-            self.geo
+            self.cur.geometry()
         }
 
         fn draw(&mut self, col: u16, row: u16, cell: &Cell) {
-            let (fw, fh) = (self.font.width as u32, self.font.height as u32);
+            let c = self.cur;
+            let (fw, fh) = (c.fw, c.fh);
+            if col >= c.cols || row >= c.rows {
+                return;
+            }
             let (mut fg, mut bg) = (0x00u8, 0xFFu8);
             if cell.dim {
                 fg = 0x60;
@@ -206,11 +261,11 @@ mod imp {
             let rows: Vec<u32> = if cell.ch == '\0' {
                 vec![0; fh as usize]
             } else {
-                let g = &self.font.glyph(cell.ch).rows;
+                let g = &self.fonts[c.font].glyph(cell.ch).rows;
                 if cell.bold { g.iter().map(|r| r | (r >> 1)).collect() } else { g.clone() }
             };
-            let px = self.x0 + col as u32 * fw;
-            let py = self.y0 + row as u32 * fh;
+            let px = c.x0 + col as u32 * fw;
+            let py = c.y0 + row as u32 * fh;
             for (dy, bits) in rows.iter().enumerate() {
                 let underline = cell.underline && dy as u32 >= fh - 2;
                 for dx in 0..fw {
@@ -256,4 +311,4 @@ mod imp {
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::FbinkPanel;
+pub use imp::{FbinkPanel, Region};

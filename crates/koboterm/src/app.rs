@@ -472,46 +472,145 @@ fn relayout(panel: &mut FbinkPanel, lay: &Layout, osk: &Osk, bar: &TopBar, fonts
     Ok(renderer)
 }
 
+enum End {
+    /// Remote command finished with this status.
+    Exit(i32),
+    /// User asked to go back to the machine list.
+    Home,
+    /// Connection dropped.
+    Lost,
+}
+
+struct SessionState {
+    lay: Layout,
+    osk: Osk,
+    bar: TopBar,
+    term: Terminal,
+    renderer: Renderer,
+    pending_release: Vec<(usize, u64)>,
+    finger_down: Option<(i32, i32)>,
+    t0: Instant,
+    margin: u32,
+    last_status: BarStatus,
+    next_status_check: u64,
+}
+
+fn ms(t0: Instant) -> u64 {
+    t0.elapsed().as_millis() as u64
+}
+
+/// One-line notice at the bottom of the terminal band.
+fn banner(panel: &mut FbinkPanel, st: &SessionState, text: &str) {
+    panel.use_region(st.lay.term);
+    let r = st.lay.term.rows.saturating_sub(1);
+    let cols = st.lay.term.cols;
+    let line: String = format!("{text:<width$}", width = cols as usize).chars().take(cols as usize).collect();
+    draw::text(panel, 0, r, &line, true, true);
+    panel.refresh(CellRect { col: 0, row: r, cols, rows: 1 }, Waveform::Fast);
+}
+
 /// Returns the remote exit status if the far end ended the session quickly
-/// (used for the tmux fallback), None otherwise.
+/// (used for the tmux fallback), None otherwise. Reconnects on its own when
+/// the link drops; a tap on Home / Back while waiting cancels.
 fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEntry, settings: &mut Settings, ctx: &Ctx, command: Option<String>) -> Result<Option<i32>> {
-    let mut margin = settings.margin;
+    let margin = settings.margin;
     let ui = panel.region_full(UI_FONT, margin);
     panel.use_region(ui);
     panel.clear()?;
     draw::text(panel, 1, 1, &format!("connecting to {} ({})...", entry.name, entry.spec), true, false);
     panel.refresh(CellRect { col: 0, row: 0, cols: ui.cols, rows: 3 }, Waveform::Fast);
 
-    let fonts = ctx.fonts.as_ref();
     let bar = TopBar::new(panel.view.0 as i32);
-    let mut lay = layout(panel, margin, bar.height(), true);
-    let mut osk = Osk::top(ui.cols, ui.rows);
+    let lay = layout(panel, margin, bar.height(), true);
+    let osk = Osk::top(ui.cols, ui.rows);
     let tg = lay.term.geometry();
     let target = SshTarget::parse(&entry.spec, &ctx.key_path, command)?;
-    let mut tr = SshTransport::connect(target, tg.cols, tg.rows)?;
-    let mut term = Terminal::new(tg.cols, tg.rows, 5000);
-    let t0 = Instant::now();
-    let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
-    let mut renderer = relayout(panel, &lay, &osk, &bar, fonts, &mut term, &mut tr, ms(t0))?;
+    let term = Terminal::new(tg.cols, tg.rows, 5000);
+    let renderer = Renderer::new(Config::default(), tg.cols, tg.rows);
+    let mut st = SessionState {
+        lay,
+        osk,
+        bar,
+        term,
+        renderer,
+        pending_release: Vec::new(),
+        finger_down: None,
+        t0: Instant::now(),
+        margin,
+        last_status: bar_status(),
+        next_status_check: 5000,
+    };
 
+    let mut attempt = 0u32;
+    let mut first = true;
+    loop {
+        match SshTransport::connect(target.clone(), st.lay.term.cols, st.lay.term.rows) {
+            Ok(mut tr) => {
+                attempt = 0;
+                first = false;
+                st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, ctx.fonts.as_ref(), &mut st.term, &mut tr, ms(st.t0))?;
+                let started = ms(st.t0);
+                match run_session(panel, touch, &mut st, &mut tr, settings, ctx)? {
+                    End::Home => return Ok(None),
+                    End::Exit(code) => {
+                        if code == 127 && ms(st.t0) - started < 5000 {
+                            return Ok(Some(code));
+                        }
+                        banner(panel, &st, &format!("[session ended ({code}); tap to go home]"));
+                        wait_tap(panel, touch, Duration::from_secs(3600));
+                        return Ok(Some(code));
+                    }
+                    End::Lost => {}
+                }
+            }
+            Err(e) => {
+                if first {
+                    // Never got in at all: report on the home screen instead of retrying.
+                    return Err(e);
+                }
+                eprintln!("reconnect failed: {e:#}");
+            }
+        }
+        attempt += 1;
+        let delay = 2u64.pow(attempt.min(4)).min(30);
+        banner(panel, &st, &format!("[connection lost; reconnecting in {delay}s, tap Home to stop]"));
+        let until = Instant::now() + Duration::from_secs(delay);
+        while Instant::now() < until {
+            for ev in touch.poll(Duration::from_millis(50)) {
+                if let TouchEvent::Tap { x, y } = ev {
+                    if !st.lay.osk_visible && y < st.bar.height() && matches!(st.bar.hit(x, y), BarAction::Back | BarAction::More) {
+                        return Ok(None);
+                    }
+                    if let Some((c, r)) = panel.cell_in(&st.lay.osk, x, y) {
+                        if st.lay.osk_visible && st.osk.hit(c, r).map(|k| st.osk.key_is_home(k)).unwrap_or(false) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+        banner(panel, &st, "[reconnecting...]");
+    }
+}
+
+fn run_session(panel: &mut FbinkPanel, touch: &mut TouchDevice, st: &mut SessionState, tr: &mut SshTransport, settings: &mut Settings, ctx: &Ctx) -> Result<End> {
+    let fonts = ctx.fonts.as_ref();
+    let t0 = st.t0;
     let mut buf = [0u8; 8192];
-    let mut pending_release: Vec<(usize, u64)> = Vec::new();
-    let mut finger_down: Option<(i32, i32)> = None;
-    let mut last_status = bar_status();
-    let mut next_status_check = 5000u64;
     loop {
         let n = tr.read(&mut buf, Duration::from_millis(10))?;
         if n > 0 {
-            term.feed(&buf[..n]);
+            st.term.feed(&buf[..n]);
         }
-        panel.use_region(lay.term);
-        let grid = term.snapshot();
-        renderer.tick(ms(t0), &grid, panel);
+        panel.use_region(st.lay.term);
+        let grid = st.term.snapshot();
+        st.renderer.tick(ms(t0), &grid, panel);
 
         let now = ms(t0);
-        if lay.osk_visible && pending_release.iter().any(|&(_, at)| now >= at) {
-            panel.use_region(lay.osk);
-            pending_release.retain(|&(k, at)| {
+        if st.lay.osk_visible && st.pending_release.iter().any(|&(_, at)| now >= at) {
+            panel.use_region(st.lay.osk);
+            let osk = &st.osk;
+            st.pending_release.retain(|&(k, at)| {
                 if now >= at {
                     osk.release(panel, k);
                     false
@@ -520,89 +619,89 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
                 }
             });
         }
-        if !lay.osk_visible && now >= next_status_check {
-            next_status_check = now + 5000;
-            let st = bar_status();
-            if st != last_status {
+        if !st.lay.osk_visible && now >= st.next_status_check {
+            st.next_status_check = now + 5000;
+            let status = bar_status();
+            if status != st.last_status {
                 if let Some(f) = fonts {
-                    bar.update_status(panel, f, &st);
+                    st.bar.update_status(panel, f, &status);
                 }
-                last_status = st;
+                st.last_status = status;
             }
         }
 
         for ev in touch.poll(Duration::from_millis(0)) {
             match ev {
-                TouchEvent::Down { x, y } => finger_down = Some((x, y)),
+                TouchEvent::Down { x, y } => st.finger_down = Some((x, y)),
                 TouchEvent::Up { x, y } => {
-                    let Some((sx, sy)) = finger_down.take() else { continue };
+                    let Some((sx, sy)) = st.finger_down.take() else { continue };
                     let dy = y - sy;
                     let dx = x - sx;
-                    if dy.abs() >= SWIPE_MIN_PX && dy.abs() > dx.abs() {
+                    if dy.abs() >= SWIPE_MIN_PX && dy.abs() > dx.abs() && panel.cell_in(&st.lay.term, sx, sy).is_some() {
                         // Swipe on the terminal: finger down = older content.
-                        let lines = (dy.abs() / lay.term.fh as i32).max(1);
+                        let lines = (dy.abs() / st.lay.term.fh as i32).max(1);
                         let older = dy > 0;
-                        let (col, row) = panel.cell_in(&lay.term, x, y).unwrap_or((0, 0));
-                        if let Some(bytes) = term.mouse_wheel_bytes(older, col, row) {
+                        let (col, row) = panel.cell_in(&st.lay.term, x, y).unwrap_or((0, 0));
+                        if let Some(bytes) = st.term.mouse_wheel_bytes(older, col, row) {
                             for _ in 0..lines {
                                 tr.write_all(&bytes)?;
                             }
                         } else {
-                            term.scroll_view(if older { lines } else { -lines });
+                            st.term.scroll_view(if older { lines } else { -lines });
                         }
                     }
                 }
                 TouchEvent::Tap { x, y } => {
-                    if !lay.osk_visible && y < bar.height() {
-                        let action = bar.hit(x, y);
-                        let notch = bar_notch(&bar, action);
+                    if !st.lay.osk_visible && y < st.bar.height() {
+                        let action = st.bar.hit(x, y);
+                        let notch = bar_notch(&st.bar, action);
                         match action {
-                            BarAction::Back | BarAction::More => return Ok(None),
+                            BarAction::Back | BarAction::More => return Ok(End::Home),
                             BarAction::Keyboard => {
-                                lay = layout(panel, margin, bar.height(), true);
-                                renderer = relayout(panel, &lay, &osk, &bar, fonts, &mut term, &mut tr, ms(t0))?;
+                                st.lay = layout(panel, st.margin, st.bar.height(), true);
+                                st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, fonts, &mut st.term, tr, ms(t0))?;
                             }
                             BarAction::Brightness => {
-                                brightness_popup(panel, touch, ctx, bar.height() + 8, notch)?;
-                                last_status = bar_status();
-                                renderer = relayout(panel, &lay, &osk, &bar, fonts, &mut term, &mut tr, ms(t0))?;
+                                brightness_popup(panel, touch, ctx, st.bar.height() + 8, notch)?;
+                                st.last_status = bar_status();
+                                st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, fonts, &mut st.term, tr, ms(t0))?;
                             }
                             BarAction::Text | BarAction::Settings => {
-                                text_popup(panel, touch, settings, ctx, bar.height() + 8, notch)?;
-                                margin = settings.margin;
-                                lay = layout(panel, margin, bar.height(), false);
-                                renderer = relayout(panel, &lay, &osk, &bar, fonts, &mut term, &mut tr, ms(t0))?;
+                                text_popup(panel, touch, settings, ctx, st.bar.height() + 8, notch)?;
+                                st.margin = settings.margin;
+                                st.lay = layout(panel, st.margin, st.bar.height(), false);
+                                st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, fonts, &mut st.term, tr, ms(t0))?;
                             }
                             BarAction::Nothing => {}
                         }
                         continue;
                     }
-                    let osk_hit = if lay.osk_visible { panel.cell_in(&lay.osk, x, y).and_then(|(c, r)| osk.hit(c, r)) } else { None };
+                    let osk_hit = if st.lay.osk_visible { panel.cell_in(&st.lay.osk, x, y).and_then(|(c, r)| st.osk.hit(c, r)) } else { None };
                     let Some(k) = osk_hit else {
                         // Tap on the terminal: toggle keyboard / top bar.
-                        pending_release.clear();
-                        lay = layout(panel, margin, bar.height(), !lay.osk_visible);
-                        renderer = relayout(panel, &lay, &osk, &bar, fonts, &mut term, &mut tr, ms(t0))?;
+                        st.pending_release.clear();
+                        st.lay = layout(panel, st.margin, st.bar.height(), !st.lay.osk_visible);
+                        st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, fonts, &mut st.term, tr, ms(t0))?;
                         continue;
                     };
-                    panel.use_region(lay.osk);
-                    osk.flash(panel, k);
-                    match osk.press(k) {
-                        OskAction::Home => return Ok(None),
+                    panel.use_region(st.lay.osk);
+                    st.osk.flash(panel, k);
+                    match st.osk.press(k) {
+                        OskAction::Home => return Ok(End::Home),
                         OskAction::Hide => {
-                            pending_release.clear();
-                            lay = layout(panel, margin, bar.height(), false);
-                            renderer = relayout(panel, &lay, &osk, &bar, fonts, &mut term, &mut tr, ms(t0))?;
+                            st.pending_release.clear();
+                            st.lay = layout(panel, st.margin, st.bar.height(), false);
+                            st.renderer = relayout(panel, &st.lay, &st.osk, &st.bar, fonts, &mut st.term, tr, ms(t0))?;
                         }
                         OskAction::ModifierChanged => {
-                            osk.draw_modifiers(panel);
+                            st.osk.draw_modifiers(panel);
                         }
                         a => {
-                            let bytes = osk.bytes_for(a);
+                            let bytes = st.osk.bytes_for(a);
                             tr.write_all(&bytes)?;
-                            term.scroll_view(-100_000); // typing returns to the live view
-                            pending_release.push((k, ms(t0) + 120));
-                            osk.draw_modifiers(panel);
+                            st.term.scroll_view(-100_000); // typing returns to the live view
+                            st.pending_release.push((k, ms(t0) + 120));
+                            st.osk.draw_modifiers(panel);
                         }
                     }
                 }
@@ -610,20 +709,11 @@ fn session_with(panel: &mut FbinkPanel, touch: &mut TouchDevice, entry: &HostEnt
             }
         }
 
-        if let Some(st) = tr.exit_status() {
-            if st == 127 && ms(t0) < 5000 {
-                return Ok(Some(st));
-            }
-            panel.use_region(lay.term);
-            let grid = term.snapshot();
-            renderer.tick(ms(t0) + 10_000, &grid, panel);
-            let tg = lay.term.geometry();
-            let r = tg.rows.saturating_sub(1);
-            let msg = if st == LOST { "[connection lost; tap to go home]".to_string() } else { format!("[session ended ({st}); tap to go home]") };
-            draw::text(panel, 1, r, &msg, true, true);
-            panel.refresh(CellRect { col: 0, row: r, cols: tg.cols, rows: 1 }, Waveform::Fast);
-            wait_tap(panel, touch, Duration::from_secs(3600));
-            return Ok(Some(st));
+        if let Some(code) = tr.exit_status() {
+            panel.use_region(st.lay.term);
+            let grid = st.term.snapshot();
+            st.renderer.tick(ms(t0) + 10_000, &grid, panel);
+            return Ok(if code == LOST { End::Lost } else { End::Exit(code) });
         }
     }
 }

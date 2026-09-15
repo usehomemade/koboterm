@@ -27,6 +27,8 @@ fn main() -> Result<()> {
         "ssh" => session::run(session::Kind::Ssh, std::env::args().skip(2).collect()),
         "keygen" => keygen(std::env::args().nth(2)),
         #[cfg(target_os = "linux")]
+        "shot" => shot::run(std::env::args().nth(2).unwrap_or_else(|| "/tmp/shot.pgm".into())),
+        #[cfg(target_os = "linux")]
         "touch-dump" => touchdump::run(std::env::args().nth(2).unwrap_or_else(|| "/dev/input/event1".into())),
         _ => {
             eprintln!("usage: koboterm probe | demo | keygen [PATH]");
@@ -229,6 +231,42 @@ fn probe() -> Result<()> {
     #[cfg(target_os = "linux")]
     inputs();
     Ok(())
+}
+
+/// Screenshot: the framebuffer downscaled 2x to an 8-bit PGM, small enough to
+/// pull over the ssh tty for a look on the laptop.
+#[cfg(target_os = "linux")]
+mod shot {
+    use anyhow::{Context, Result};
+
+    pub fn run(out: String) -> Result<()> {
+        let font = font::Font::from_bdf(font::SPLEEN_16X32);
+        let panel = panel_fbink::FbinkPanel::open(font)?;
+        let (w, h) = (panel.view.0 as usize, panel.view.1 as usize);
+        let raw = panel.save_screen();
+        let stride = raw.len() / (panel.view.1 as usize + panel.view_origin().1 as usize).max(1);
+        let bpp = stride / w.max(1);
+        let (ox, oy) = (panel.view_origin().0 as usize, panel.view_origin().1 as usize);
+        let (ow, oh) = (w / 2, h / 2);
+        let mut img = Vec::with_capacity(ow * oh);
+        for y in 0..oh {
+            for x in 0..ow {
+                let mut sum = 0u32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let sx = ox + x * 2 + dx;
+                    let sy = oy + y * 2 + dy;
+                    let off = sy * stride + sx * bpp;
+                    sum += *raw.get(off).unwrap_or(&0xFF) as u32;
+                }
+                img.push((sum / 4) as u8);
+            }
+        }
+        let mut data = format!("P5\n{ow} {oh}\n255\n").into_bytes();
+        data.extend_from_slice(&img);
+        std::fs::write(&out, data).with_context(|| out.clone())?;
+        println!("wrote {out} ({ow}x{oh})");
+        Ok(())
+    }
 }
 
 /// Print absolute-axis ranges and then raw events for 10 s, for mapping touch.

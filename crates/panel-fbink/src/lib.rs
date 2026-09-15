@@ -187,6 +187,10 @@ mod imp {
             Ok(())
         }
 
+        pub fn view_origin(&self) -> (u32, u32) {
+            self.view_origin
+        }
+
         pub fn font(&self) -> &Font {
             &self.fonts[self.cur.font]
         }

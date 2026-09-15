@@ -11,12 +11,37 @@ fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         "demo" => demo::run(),
         #[cfg(target_os = "linux")]
-        "run" => session::run(std::env::args().skip(2).collect()),
+        "run" => session::run(session::Kind::Pty, std::env::args().skip(2).collect()),
+        #[cfg(target_os = "linux")]
+        "ssh" => session::run(session::Kind::Ssh, std::env::args().skip(2).collect()),
+        "keygen" => keygen(std::env::args().nth(2)),
         _ => {
-            eprintln!("usage: koboterm probe | demo | run [--type TEXT]... [--hold SECS] -- CMD [ARGS...]");
+            eprintln!("usage: koboterm probe | demo | keygen [PATH]");
+            eprintln!("       koboterm run [--type TEXT]... [--hold SECS] -- CMD [ARGS...]");
+            eprintln!("       koboterm ssh user@host[:port] [--key PATH] [--cmd COMMAND] [--type TEXT]... [--hold SECS]");
             std::process::exit(2);
         }
     }
+}
+
+fn default_key_path() -> std::path::PathBuf {
+    let onboard = std::path::Path::new("/mnt/onboard/.adds/koboterm");
+    if onboard.parent().map(|p| p.exists()).unwrap_or(false) {
+        onboard.join("id_ed25519")
+    } else {
+        std::path::PathBuf::from("koboterm_id_ed25519")
+    }
+}
+
+fn keygen(path: Option<String>) -> Result<()> {
+    let path = path.map(std::path::PathBuf::from).unwrap_or_else(default_key_path);
+    if path.exists() {
+        anyhow::bail!("{} already exists; delete it first to regenerate", path.display());
+    }
+    let public = transport::keygen(&path, "koboterm")?;
+    println!("{public}");
+    eprintln!("private key: {}", path.display());
+    Ok(())
 }
 
 /// Run a command under a pty and show it on the panel until it exits.
@@ -29,17 +54,26 @@ mod session {
     use render::{Config, Renderer};
     use std::time::{Duration, Instant};
     use term::Terminal;
-    use transport::{PtyTransport, Transport};
+    use transport::{PtyTransport, SshTarget, SshTransport, Transport};
 
-    pub fn run(args: Vec<String>) -> Result<()> {
+    pub enum Kind {
+        Pty,
+        Ssh,
+    }
+
+    pub fn run(kind: Kind, args: Vec<String>) -> Result<()> {
         let mut typed: Vec<String> = Vec::new();
         let mut hold = 2u64;
         let mut cmd: Vec<String> = Vec::new();
+        let mut key: Option<String> = None;
+        let mut remote_cmd: Option<String> = None;
         let mut it = args.into_iter();
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--type" => typed.push(it.next().unwrap_or_default().replace("\\n", "\n").replace("\\t", "\t")),
                 "--hold" => hold = it.next().unwrap_or_default().parse().unwrap_or(2),
+                "--key" => key = it.next(),
+                "--cmd" => remote_cmd = it.next(),
                 "--" => {
                     cmd.extend(it.by_ref());
                     break;
@@ -47,15 +81,26 @@ mod session {
                 other => cmd.push(other.to_string()),
             }
         }
-        if cmd.is_empty() {
-            cmd.push("/bin/sh".into());
-        }
         let font = font::Font::from_bdf(font::SPLEEN_16X32);
         let mut panel = panel_fbink::FbinkPanel::open(font)?;
         let g = panel.geometry();
         panel.clear()?;
-        let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
-        let mut tr = PtyTransport::spawn(&argv, g.cols, g.rows)?;
+        let mut tr: Box<dyn Transport> = match kind {
+            Kind::Pty => {
+                if cmd.is_empty() {
+                    cmd.push("/bin/sh".into());
+                }
+                let argv: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
+                Box::new(PtyTransport::spawn(&argv, g.cols, g.rows)?)
+            }
+            Kind::Ssh => {
+                let spec = cmd.first().cloned().unwrap_or_default();
+                let key_path = key.map(std::path::PathBuf::from).unwrap_or_else(super::default_key_path);
+                let target = SshTarget::parse(&spec, &key_path, remote_cmd)?;
+                eprintln!("connecting to {}@{}:{} with {}", target.user, target.host, target.port, key_path.display());
+                Box::new(SshTransport::connect(target, g.cols, g.rows)?)
+            }
+        };
         let mut term = Terminal::new(g.cols, g.rows, 0);
         let mut r = Renderer::new(Config::default(), g.cols, g.rows);
         let t0 = Instant::now();

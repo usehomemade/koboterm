@@ -16,6 +16,8 @@ transport = { path = "crates/transport" }
 fbink-sys = { path = "crates/fbink-sys" }
 panel-fbink = { path = "crates/panel-fbink" }
 cc = "1"
+russh = { version = "0.63", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util", "macros"] }
 vt100 = "0.15"
 libc = "0.2"
 anyhow = "1"

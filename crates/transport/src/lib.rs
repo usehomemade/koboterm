@@ -3,6 +3,9 @@
 //! it is also how an external `ssh`/`mosh-client` would be driven. An
 //! in-process SSH transport can implement the same trait later.
 
+pub mod ssh;
+pub use ssh::{keygen, SshTarget, SshTransport};
+
 use anyhow::{bail, Context, Result};
 use std::ffi::CString;
 use std::io;

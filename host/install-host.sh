@@ -91,8 +91,9 @@ else
   IP="$(ip route get "$(printf '%s' "$KOBO_URL" | sed -E 's#https?://([^:/]+).*#\1#')" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
 fi
 [ -n "$IP" ] || IP="$(hostname)"
+# Absolute path: ssh runs commands in a non-login shell whose PATH may lack Homebrew.
 CMD=""
-[ -n "$TMUX" ] && CMD="tmux new -A -s $SESSION"
+[ -n "$TMUX" ] && CMD="$TMUX new -A -s $SESSION"
 urlenc() { printf '%s' "$1" | od -An -tx1 -v | tr ' ' '\n' | grep -v '^$' | awk '{printf "%%%s", $1}'; }
 BODY="name=$(urlenc "$NAME")&spec=$(urlenc "$USER@$IP")&cmd=$(urlenc "$CMD")"
 if curl -fsS -X POST --data "$BODY" "$KOBO_URL/register" >/dev/null; then
@@ -101,5 +102,5 @@ else
   say "could not reach the Kobo at $KOBO_URL; add $USER@$IP on the Kobo by hand."
 fi
 if [ -n "$CMD" ]; then
-  say "sessions attach to tmux '$SESSION'. Start your tools inside it: tmux new -A -s $SESSION"
+  say "sessions attach to tmux '$SESSION'. Start your tools inside it: tmux attach -t $SESSION"
 fi
